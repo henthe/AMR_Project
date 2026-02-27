@@ -151,6 +151,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.progress_window_s = float(self.get_parameter("progress_window_s").value)
         self.progress_min_delta_m = float(self.get_parameter("progress_min_delta_m").value)
         self.goal_dist_hist = deque(maxlen=400)
+        self.ang_cmd_hist: deque = deque(maxlen=200)
 
         qos_map = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -261,6 +262,22 @@ class FrontierPotentialFieldExplorer(Node):
                 return
 
         cmd = self.potential_field_cmd(rx, ry, yaw, gx, gy, self.scan)
+
+        # Oscillation detection: rapidly alternating angular commands = corner wiggling
+        self.ang_cmd_hist.append((time.time(), cmd.angular.z))
+        if self.is_oscillating():
+            self.get_logger().warn("Oscillation detected, triggering recovery")
+            self.ang_cmd_hist.clear()
+            self.have_filtered = False
+            if self.recovery_enable and self.recoveries_this_goal < self.max_recoveries_per_goal:
+                self.start_recovery()
+                return
+            self.add_blacklist(gx, gy)
+            self.current_goal_world = None
+            self.recoveries_this_goal = 0
+            self.stop_robot()
+            return
+
         self.cmd_pub.publish(cmd)
 
     def warmup_done(self) -> bool:
@@ -494,8 +511,7 @@ class FrontierPotentialFieldExplorer(Node):
         angles = angles[valid]
 
         front_cone = np.abs(angles) < math.radians(35.0)
-        if np.any(ranges[front_cone] < self.stop_range):
-            return Twist()
+        front_blocked = bool(np.any(ranges[front_cone] < self.stop_range))
 
         F_rep = np.zeros(2, dtype=np.float32)
         in_range = ranges < self.rep_range
@@ -517,6 +533,22 @@ class FrontierPotentialFieldExplorer(Node):
 
             F_rep[0] = float(np.clip(np.sum(fx), -6.0, 6.0))
             F_rep[1] = float(np.clip(np.sum(fy), -6.0, 6.0))
+
+        # Tangential force: when repulsion opposes attraction (corner/dead-end),
+        # add a perpendicular component so the robot slides along the wall.
+        F_rep_mag = float(np.linalg.norm(F_rep))
+        F_att_mag = float(np.linalg.norm(F_att))
+        if F_rep_mag > 0.3 and F_att_mag > 0.01:
+            cos_angle = float(np.dot(F_att, F_rep)) / (F_att_mag * F_rep_mag)
+            if cos_angle < -0.2:  # forces opposing (angle > ~102°)
+                tangent = np.array([-F_rep[1], F_rep[0]], dtype=np.float32)
+                if np.dot(tangent, F_att) < 0:
+                    tangent = -tangent
+                t_norm = float(np.linalg.norm(tangent))
+                if t_norm > 1e-6:
+                    tangent = tangent / t_norm
+                    blend = min(1.0, (-cos_angle - 0.2) / 0.6)
+                    F_rep = F_rep + blend * 0.5 * F_rep_mag * tangent
 
         F = F_att + F_rep
 
@@ -542,6 +574,10 @@ class FrontierPotentialFieldExplorer(Node):
         # Wenn er stark drehen muss, gib eine minimale Vorwärtsfahrt, sonst zittert er auf der Stelle
         if abs(heading_err) > math.radians(50.0):
             lin = max(lin, self.min_lin_when_turning)
+
+        # Front blocked: stop forward motion but keep turning to escape
+        if front_blocked:
+            lin = 0.0
 
         cmd = Twist()
         cmd.linear.x = float(lin)
@@ -572,11 +608,26 @@ class FrontierPotentialFieldExplorer(Node):
         d1 = pts[-1][1]
         return (d0 - d1) < self.progress_min_delta_m
 
+    def is_oscillating(self) -> bool:
+        now = time.time()
+        pts = [(t, v) for t, v in self.ang_cmd_hist if (now - t) <= 2.5]
+        if len(pts) < 15:
+            return False
+        sign_changes = 0
+        for i in range(1, len(pts)):
+            if (pts[i][1] * pts[i - 1][1] < 0
+                    and abs(pts[i][1]) > 0.05
+                    and abs(pts[i - 1][1]) > 0.05):
+                sign_changes += 1
+        return sign_changes >= 5
+
     def start_recovery(self) -> None:
         self.recoveries_this_goal += 1
         self.recovery_start_wall_time = time.time()
         self.mode = "RECOVERY_BACKUP"
         self.recovery_turn_sign = self.choose_turn_direction_from_scan()
+        self.ang_cmd_hist.clear()
+        self.have_filtered = False
         self.get_logger().warn(f"Recovery started, attempt {self.recoveries_this_goal}, turn_sign {self.recovery_turn_sign}")
 
     def choose_turn_direction_from_scan(self) -> float:

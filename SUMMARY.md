@@ -87,11 +87,14 @@ AMR_Project/                          # ROS 2 ament_python package root
   1. Warmup phase (rotate + slight forward motion).
   2. Picks the frontier cluster point farthest from the robot, scored by `2.0 * size + 0.6 * distance`.
   3. Drives toward the goal using attractive + repulsive potential fields from LiDAR (same approach as planner_pf_node).
-  4. Low-pass filters heading and angular velocity commands for smooth motion.
-  5. Stuck detection: if path traveled in a time window is below threshold, triggers recovery.
-  6. Recovery behavior: back up, then turn toward the more open side (based on LiDAR).
-  7. Periodically reselects frontier goal (every N seconds).
-  8. Clears blacklist and retries if all candidates are blacklisted.
+  4. **Tangential wall-sliding force:** When repulsive and attractive forces oppose each other (corners/dead-ends), a perpendicular component is added to the repulsive force so the robot slides along walls instead of oscillating.
+  5. **Front-blocked rotation:** When an obstacle is within stop_range in the front cone, forward motion is suppressed but the robot can still rotate to escape (no hard stop).
+  6. Low-pass filters heading and angular velocity commands for smooth motion.
+  7. Stuck detection: if path traveled in a time window is below threshold, triggers recovery.
+  8. **Oscillation detection:** If the angular command rapidly alternates sign (5+ reversals in 2.5 s), recovery is triggered immediately — faster than general stuck detection.
+  9. Recovery behavior: back up, then turn toward the more open side (based on LiDAR).
+  10. Periodically reselects frontier goal (every N seconds).
+  11. Clears blacklist and retries if all candidates are blacklisted.
 - **Subscribes:** `/map` (OccupancyGrid), `/scan` (LaserScan)
 - **Publishes:** `/cmd_vel` (Twist)
 - **TF:** Reads `map → base_link`
@@ -99,7 +102,7 @@ AMR_Project/                          # ROS 2 ament_python package root
 
 ## Shared Algorithms & Patterns
 
-- **Potential field controller** — Used in nodes 1 and 4. Attractive force toward goal, repulsive forces from nearby LiDAR points. Emergency stop if obstacle in front cone < stop_range. Linear speed scaled by heading error cosine.
+- **Potential field controller** — Used in nodes 1 and 4. Attractive force toward goal, repulsive forces from nearby LiDAR points. In node 4, a tangential component is added when forces oppose (corner escape), and front-blocked only suppresses linear speed (rotation continues). Linear speed scaled by heading error cosine.
 - **Frontier detection** — Used in nodes 3 and 4. Iterates occupancy grid, finds free cells with unknown neighbors, clusters via BFS flood-fill.
 - **Map loading from YAML/PGM** — Used in nodes 1 and 2. Parses slam_toolbox-style map files (image path, resolution, origin, thresholds). Node 2 also supports receiving the map via topic.
 - **TF lookups** — All nodes use tf2_ros to get the robot pose in the map frame.
