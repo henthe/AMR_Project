@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build
+build/
+install/
+log/
+
+# ROS
+*.so
+
+# VS Code
+.vscode/
+
+# Maps temporary
+*.pgm~
