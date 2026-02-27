@@ -111,7 +111,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.declare_parameter("waypoint_every_n_cells", 20)
         self.declare_parameter("stuck_window_s", 5.0)
-        self.declare_parameter("stuck_threshold_m", 0.08)
+        self.declare_parameter("stuck_threshold_m", 0.20)
         self.declare_parameter("goal_blacklist_radius_m", 0.5)
 
         self.declare_parameter("recovery_back_duration_s", 1.0)
@@ -151,6 +151,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         # Front-blocked tracking (corner detection)
         self.front_blocked_since: Optional[float] = None
+        self.front_clear_since: Optional[float] = None  # hysteresis
         self.last_status_log: float = 0.0
 
         # Recovery / random walk
@@ -733,6 +734,7 @@ class FrontierPotentialFieldExplorer(Node):
             self.recovery_phase = 0
             self.random_walk_start = None
             self.front_blocked_since = None
+            self.front_clear_since = None
             if self.current_goal is not None:
                 self.blacklisted_goals.append(self.current_goal)
             self.set_state(RECOVERY, "stuck detected → random walk")
@@ -750,6 +752,7 @@ class FrontierPotentialFieldExplorer(Node):
                 self.recovery_phase = 0
                 self.random_walk_start = None
                 self.front_blocked_since = None
+                self.front_clear_since = None
                 if self.current_goal is not None:
                     self.blacklisted_goals.append(self.current_goal)
                 self.set_state(RECOVERY, f"front blocked {blocked_dur:.1f}s → random walk")
@@ -886,12 +889,18 @@ class FrontierPotentialFieldExplorer(Node):
             lin *= proximity_factor
 
         # Front-blocked: stop forward motion, rotation continues
+        # Hysteresis: only clear front_blocked_since after front is clear for 0.5s
+        now_fb = self.get_clock().now().nanoseconds * 1e-9
         if front_blocked:
             lin = 0.0
+            self.front_clear_since = None
             if self.front_blocked_since is None:
-                self.front_blocked_since = self.get_clock().now().nanoseconds * 1e-9
+                self.front_blocked_since = now_fb
         else:
-            self.front_blocked_since = None
+            if self.front_clear_since is None:
+                self.front_clear_since = now_fb
+            if now_fb - self.front_clear_since > 0.5:
+                self.front_blocked_since = None
 
         cmd = Twist()
         cmd.linear.x = float(lin)
