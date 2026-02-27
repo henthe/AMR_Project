@@ -721,7 +721,7 @@ class FrontierPotentialFieldExplorer(Node):
             if dist_to_goal < goal_dist:
                 self.set_state(FIND_FRONTIER, "goal reached")
                 return
-            if dist_to_goal < goal_dist * 3.0 and now_s - self.navigate_start_time > 5.0:
+            if dist_to_goal < goal_dist * 1.5 and now_s - self.navigate_start_time > 5.0:
                 self.set_state(FIND_FRONTIER, f"close enough ({dist_to_goal:.2f}m)")
                 return
 
