@@ -184,6 +184,9 @@ class FrontierPotentialFieldExplorer(Node):
         self.recovery_turn_sign = 1.0
         self.recoveries_this_goal = 0
 
+        self.loop_count = 0
+        self.status_every_n = 40  # every ~2s at 20Hz
+
         self.timer = self.create_timer(0.05, self.loop)
         self.get_logger().info("Frontier PF Explorer started")
 
@@ -203,6 +206,10 @@ class FrontierPotentialFieldExplorer(Node):
         if pose is None:
             return
         rx, ry, yaw = pose
+
+        self.loop_count += 1
+        if self.loop_count % self.status_every_n == 0:
+            self.log_status(rx, ry)
 
         if self.in_warmup:
             if self.warmup_done():
@@ -301,6 +308,24 @@ class FrontierPotentialFieldExplorer(Node):
 
     def stop_robot(self) -> None:
         self.cmd_pub.publish(Twist())
+
+    def log_status(self, rx: float, ry: float) -> None:
+        if self.in_warmup:
+            elapsed = time.time() - self.warmup_start_wall_time
+            self.get_logger().info(f"[WARMUP] elapsed={elapsed:.1f}s pos=({rx:.2f},{ry:.2f})")
+            return
+        if self.mode != "NORMAL":
+            self.get_logger().info(
+                f"[{self.mode}] attempt={self.recoveries_this_goal} pos=({rx:.2f},{ry:.2f})")
+            return
+        if self.current_goal_world is None:
+            self.get_logger().info(f"[SEARCHING] pos=({rx:.2f},{ry:.2f}) blacklisted={len(self.blacklisted_goals)}")
+            return
+        gx, gy = self.current_goal_world
+        dist = math.hypot(gx - rx, gy - ry)
+        self.get_logger().info(
+            f"[DRIVING] goal=({gx:.2f},{gy:.2f}) dist={dist:.2f}m pos=({rx:.2f},{ry:.2f})"
+            f" recoveries={self.recoveries_this_goal}")
 
     def map_big_enough(self, grid: OccupancyGrid) -> bool:
         sx = float(grid.info.width) * float(grid.info.resolution)
