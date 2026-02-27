@@ -143,6 +143,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         # Stuck detection
         self.pose_history: List[Tuple[float, float, float]] = []  # (x, y, stamp)
+        self.navigate_start_time: float = 0.0
 
         # Recovery
         self.recovery_start: Optional[float] = None
@@ -458,9 +459,14 @@ class FrontierPotentialFieldExplorer(Node):
     # ================================================================ #
     def check_stuck(self, x: float, y: float) -> bool:
         now = self.get_clock().now().nanoseconds * 1e-9
-        self.pose_history.append((x, y, now))
 
+        # Grace period: don't check stuck for the first stuck_window seconds
+        # after entering NAVIGATE (robot needs time to rotate toward waypoint)
         window = float(self.get_parameter("stuck_window_s").value)
+        if now - self.navigate_start_time < window:
+            return False
+
+        self.pose_history.append((x, y, now))
         threshold = float(self.get_parameter("stuck_threshold_m").value)
 
         # Trim old entries
@@ -468,8 +474,8 @@ class FrontierPotentialFieldExplorer(Node):
 
         if len(self.pose_history) < 2:
             return False
-        # Need sufficient data (at least half the window)
-        if now - self.pose_history[0][2] < window * 0.5:
+        # Need the full window of data before declaring stuck
+        if now - self.pose_history[0][2] < window * 0.8:
             return False
 
         total_dist = 0.0
@@ -580,6 +586,7 @@ class FrontierPotentialFieldExplorer(Node):
         if self.plan_to_goal(goal[0], goal[1]):
             self.last_goal_select_time = now_s
             self.pose_history.clear()
+            self.navigate_start_time = now_s
             self.set_state(NAVIGATE)
         else:
             # Blacklist unreachable goal and try again next tick
