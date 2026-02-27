@@ -68,27 +68,30 @@ AMR_Project/                          # ROS 2 ament_python package root
 - **Builds on:** Assignment 1 (`planner_pf_node.py`) — imports `astar`, `extract_waypoints`, `clamp`, `wrap_angle`.
 - **State machine:** `WARMUP → FIND_FRONTIER → NAVIGATE → RECOVERY → DONE`
 - **How it works:**
-  1. **Warmup phase** (~5 s): rotates in place so SLAM Toolbox builds an initial map.
-  2. **Frontier detection:** finds free cells (value 0) adjacent to unknown cells (value −1) on the OccupancyGrid, clusters them via BFS, filters by minimum size.
-  3. **Frontier scoring:** `w_size × cluster_size − w_dist × distance_to_robot`. Picks the highest-scoring non-blacklisted cluster; computes centroid as goal.
-  4. **Path planning:** builds an inflated planning grid from the SLAM map (unknown → obstacle), runs A* from robot to frontier centroid, extracts sparse waypoints.
+  1. **Warmup phase** (~5 s): rotates in place (0.8 rad/s) so SLAM Toolbox builds an initial map.
+  2. **Frontier detection:** finds free cells (value 0) adjacent to unknown cells (value −1) on the OccupancyGrid using vectorized NumPy 8-neighbor shifts, clusters them via BFS, filters by minimum size.
+  3. **Frontier scoring:** `0.3 × cluster_size − 2.0 × distance_to_robot`. Strongly prefers nearby frontiers over large distant ones. Picks the highest-scoring non-blacklisted cluster; computes centroid as goal.
+  4. **Path planning:** builds an inflated planning grid from the SLAM map (unknown → free for exploration, occupied → obstacle), runs A* from robot to frontier centroid, extracts sparse waypoints. Safety in unknown space is handled by LiDAR-based potential field, not the planner.
   5. **Potential field navigation:** attractive force toward current waypoint + repulsive forces from LiDAR obstacles. Skips passed waypoints.
-  6. **Tangential wall-sliding:** when attractive and repulsive forces oppose (dot product < −0.3), a perpendicular component is added to the repulsive force so the robot slides along walls instead of oscillating.
-  7. **Front-blocked rotation:** when an obstacle is within `stop_range_m` in the front cone, forward motion is suppressed but the robot can still rotate to escape.
-  8. **Stuck detection:** if total distance traveled in a sliding time window falls below threshold, triggers recovery.
-  9. **Recovery:** back up briefly, then rotate toward the more open side (LiDAR left vs right range sums).
-  10. **Periodic reselection:** every `reselect_goal_every_s` seconds, picks a new frontier goal using the latest SLAM map.
-  11. **Blacklist management:** unreachable or stuck-at goals are blacklisted; blacklist is cleared if all candidates become blacklisted.
+  6. **Tangential wall-sliding:** when attractive and repulsive forces oppose (dot product < −0.3), computes both perpendicular directions to the repulsive force and picks the one more aligned with the attractive force. This prevents oscillation in corners while choosing a consistent escape direction.
+  7. **Front-blocked rotation:** when an obstacle is within `stop_range_m` (0.30 m) in the ±50° front cone, forward motion is suppressed but the robot can still rotate to escape. If front-blocked continuously for >2 s, triggers recovery (corner timeout).
+  8. **Proximity speed scaling:** linear speed is scaled by `min_range / repulsion_range` (floor 0.05), so the robot slows down near obstacles proportionally.
+  9. **Stuck detection:** checks both total distance traveled AND net displacement (straight-line start→end) over a sliding time window. Net displacement catches oscillation where total distance accumulates but no progress is made.
+  10. **Recovery (random walk):** back up briefly (−0.15 m/s, 1 s), then perform a random walk — alternating random turns (random direction, 0.5–1.5 s) and forward drives (0.25 m/s, 0.5–1.5 s) for `random_walk_duration_s` (5 s). Forward drives are skipped when the front is blocked. Stuck events are logged at WARN level with position.
+  11. **Periodic reselection:** every `reselect_goal_every_s` (5 s), re-evaluates frontier goals using the latest SLAM map, adapting to newly discovered areas.
+  12. **Blacklist management:** unreachable or stuck-at goals are blacklisted; blacklist is cleared if all candidates become blacklisted.
+  13. **RViz visualization:** publishes MarkerArray on `/explorer_markers` — green LINE_STRIP for A* path, red SPHERE_LIST for waypoints, blue SPHERE for current goal. Republished every ~5 s.
+  14. **Periodic status logging:** consolidated log every ~5 s with state, position, goal, waypoint progress, blacklist count.
 - **Subscribes:** `/map` (OccupancyGrid, QoS: reliable + transient local), `/scan` (LaserScan, QoS: sensor data)
-- **Publishes:** `/cmd_vel` (Twist)
+- **Publishes:** `/cmd_vel` (Twist), `/explorer_markers` (MarkerArray — A* path + waypoints + goal for RViz)
 - **TF:** Reads `map → base_link`
-- **Key parameters:** `inflation_radius_m`, `k_att`, `k_rep`, `repulsion_range_m`, `stop_range_m`, `k_heading`, `max_lin`, `max_ang`, `goal_reached_dist_m`, `min_frontier_cluster_size`, `score_size_weight`, `score_distance_weight`, `reselect_goal_every_s`, `warmup_duration_s`, `waypoint_every_n_cells`, `stuck_window_s`, `stuck_threshold_m`, `goal_blacklist_radius_m`, `recovery_back_duration_s`, `recovery_turn_duration_s`
+- **Key parameters (defaults):** `inflation_radius_m` (0.35), `k_att` (1.0), `k_rep` (1.5), `repulsion_range_m` (0.7), `stop_range_m` (0.30), `k_heading` (2.5), `max_lin` (0.5), `max_ang` (1.5), `goal_reached_dist_m` (0.35), `min_frontier_cluster_size` (5), `score_size_weight` (0.3), `score_distance_weight` (2.0), `reselect_goal_every_s` (5.0), `warmup_duration_s` (5.0), `warmup_angular_speed` (0.8), `waypoint_every_n_cells` (20), `stuck_window_s` (5.0), `stuck_threshold_m` (0.08), `goal_blacklist_radius_m` (0.5), `recovery_back_duration_s` (1.0), `recovery_back_speed` (−0.15), `random_walk_duration_s` (5.0), `random_walk_lin` (0.25), `random_walk_ang` (1.5)
 
 ## Shared Algorithms & Patterns
 
 - **A* path planning** — Defined in `planner_pf_node.py`, imported by `frontier_pf_explorer_node.py`. Standard A* on an inflated 2D occupancy grid (0=free, 100=obstacle). 8-connected neighborhoods, Euclidean heuristic.
 - **Waypoint extraction** — Defined in `planner_pf_node.py`, imported by `frontier_pf_explorer_node.py`. Reduces dense cell path to sparse waypoints via turning-point detection + every-N-cells sampling.
-- **Potential field controller** — Used in nodes 1 and 3. Attractive force toward goal, repulsive forces from nearby LiDAR points. In node 3, a tangential component is added when forces oppose (corner escape), and front-blocked only suppresses linear speed (rotation continues). Linear speed scaled by heading error cosine.
+- **Potential field controller** — Used in nodes 1 and 3. Attractive force toward goal, repulsive forces from nearby LiDAR points. In node 3: tangential wall-sliding with consistent direction selection (picks perpendicular aligned with attractive force), front-blocked only suppresses linear speed (rotation continues, 2 s timeout → recovery), proximity speed scaling (slows near obstacles), linear speed scaled by heading error cosine.
 - **Frontier detection** — Used in node 3. Vectorized NumPy detection of free cells adjacent to unknown cells, then BFS clustering.
 - **Map loading from YAML/PGM** — Used in nodes 1 and 2. Parses slam_toolbox-style map files (image path, resolution, origin, thresholds). Node 2 also supports receiving the map via topic.
 - **TF lookups** — All nodes use tf2_ros to get the robot pose in the map frame.
@@ -99,7 +102,7 @@ AMR_Project/                          # ROS 2 ament_python package root
 |---|---|
 | `rclpy`, `geometry_msgs`, `nav_msgs`, `sensor_msgs`, `std_msgs` | All nodes |
 | `tf2_ros`, `tf_transformations` | All nodes |
-| `visualization_msgs` | planner_pf_node |
+| `visualization_msgs` | planner_pf_node, frontier_pf_explorer_node |
 | `numpy` | All nodes |
 | `scipy.ndimage` | planner_pf_node, frontier_pf_explorer_node (optional, for obstacle inflation) |
 | `pyyaml` | planner_pf_node, particle_filter_localization |
@@ -107,7 +110,7 @@ AMR_Project/                          # ROS 2 ament_python package root
 
 ## Configuration Files
 
-- **`config/slam_toolbox_override.yaml`** — Overrides for SLAM Toolbox: sim time enabled, map update interval 0.05s, laser range 0.12–5.6m.
+- **`config/slam_toolbox_override.yaml`** — Overrides for SLAM Toolbox: sim time enabled, aggressive map update (interval 0.02 s, travel distance 0.01 m, travel heading 0.05 rad), laser range 0.12–5.6 m.
 - **`maps/first_try.yaml`** — Map metadata: 0.05 m/px resolution, origin at (-1.55, -4.93, 0).
 
 ## Typical Usage Scenarios

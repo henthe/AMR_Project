@@ -11,6 +11,7 @@ and the potential field concept.
 """
 
 import math
+import random
 from collections import deque
 from typing import List, Tuple, Optional
 
@@ -114,9 +115,10 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("goal_blacklist_radius_m", 0.5)
 
         self.declare_parameter("recovery_back_duration_s", 1.0)
-        self.declare_parameter("recovery_turn_duration_s", 1.5)
         self.declare_parameter("recovery_back_speed", -0.15)
-        self.declare_parameter("recovery_turn_speed", 1.2)
+        self.declare_parameter("random_walk_duration_s", 5.0)
+        self.declare_parameter("random_walk_lin", 0.25)
+        self.declare_parameter("random_walk_ang", 1.5)
 
         # ----- State -----
         self.state = WARMUP
@@ -151,9 +153,12 @@ class FrontierPotentialFieldExplorer(Node):
         self.front_blocked_since: Optional[float] = None
         self.last_status_log: float = 0.0
 
-        # Recovery
+        # Recovery / random walk
         self.recovery_start: Optional[float] = None
-        self.recovery_phase: int = 0  # 0=back, 1=turn
+        self.recovery_phase: int = 0  # 0=back, 1=turn, 2=drive
+        self.random_walk_start: Optional[float] = None
+        self.random_walk_turn_dir: float = 1.0
+        self.random_walk_phase_dur: float = 0.0
 
         # ----- TF -----
         self.tf_buffer = tf2_ros.Buffer()
@@ -721,24 +726,33 @@ class FrontierPotentialFieldExplorer(Node):
 
         # Stuck detection
         if self.check_stuck(x, y):
+            self.get_logger().warn(
+                f"STUCK at ({x:.2f}, {y:.2f}) — starting random walk"
+            )
             self.recovery_start = now_s
             self.recovery_phase = 0
+            self.random_walk_start = None
             self.front_blocked_since = None
             if self.current_goal is not None:
                 self.blacklisted_goals.append(self.current_goal)
-            self.set_state(RECOVERY, "stuck detected")
+            self.set_state(RECOVERY, "stuck detected → random walk")
             return
 
         # Corner detection: front blocked for too long → recovery
         if self.front_blocked_since is not None:
             blocked_dur = now_s - self.front_blocked_since
             if blocked_dur > 2.0:
+                self.get_logger().warn(
+                    f"STUCK (front blocked {blocked_dur:.1f}s) at "
+                    f"({x:.2f}, {y:.2f}) — starting random walk"
+                )
                 self.recovery_start = now_s
                 self.recovery_phase = 0
+                self.random_walk_start = None
                 self.front_blocked_since = None
                 if self.current_goal is not None:
                     self.blacklisted_goals.append(self.current_goal)
-                self.set_state(RECOVERY, f"front blocked {blocked_dur:.1f}s")
+                self.set_state(RECOVERY, f"front blocked {blocked_dur:.1f}s → random walk")
                 return
 
         # Waypoint advancement (skip passed waypoints)
@@ -888,66 +902,88 @@ class FrontierPotentialFieldExplorer(Node):
     #  Recovery behavior
     # ================================================================ #
     def _do_recovery(self, now_s: float):
+        """Recovery = back up briefly, then random walk to escape."""
         if self.recovery_start is None:
             self.recovery_start = now_s
 
         elapsed = now_s - self.recovery_start
         back_dur = float(self.get_parameter("recovery_back_duration_s").value)
-        turn_dur = float(self.get_parameter("recovery_turn_duration_s").value)
+        rw_dur = float(self.get_parameter("random_walk_duration_s").value)
+        rw_lin = float(self.get_parameter("random_walk_lin").value)
+        rw_ang = float(self.get_parameter("random_walk_ang").value)
+        stop_range = float(self.get_parameter("stop_range_m").value)
 
         cmd = Twist()
 
+        # Phase 0: back up
         if self.recovery_phase == 0:
-            # Phase 0: back up
             if elapsed < back_dur:
                 cmd.linear.x = float(self.get_parameter("recovery_back_speed").value)
                 self.cmd_pub.publish(cmd)
                 return
             else:
+                # Transition to random walk
                 self.recovery_phase = 1
+                self.random_walk_start = now_s
                 self.recovery_start = now_s
-                elapsed = 0.0
+                self._new_random_walk_step()
+                return
 
+        # Phase 1: random turn
         if self.recovery_phase == 1:
-            # Phase 1: turn toward more open side
-            if elapsed < turn_dur:
-                turn_dir = self._open_side_direction()
-                cmd.angular.z = turn_dir * float(
-                    self.get_parameter("recovery_turn_speed").value
-                )
+            elapsed_phase = now_s - self.recovery_start
+            if elapsed_phase < self.random_walk_phase_dur:
+                cmd.angular.z = self.random_walk_turn_dir * rw_ang
                 self.cmd_pub.publish(cmd)
                 return
             else:
-                # Recovery complete
+                # Transition to forward drive
+                self.recovery_phase = 2
+                self.recovery_start = now_s
+                self.random_walk_phase_dur = random.uniform(0.5, 1.5)
+                return
+
+        # Phase 2: drive forward (with front safety check)
+        if self.recovery_phase == 2:
+            elapsed_phase = now_s - self.recovery_start
+
+            # Check if front is blocked — skip forward, go to next turn
+            front_blocked = False
+            if self.scan is not None:
+                ranges = np.array(self.scan.ranges, dtype=np.float64)
+                angles = (
+                    self.scan.angle_min
+                    + np.arange(len(ranges), dtype=np.float64)
+                    * self.scan.angle_increment
+                )
+                valid = np.isfinite(ranges) & (ranges > 0.0)
+                front_cone = np.abs(angles[valid]) < math.radians(50.0)
+                if front_cone.any() and np.any(ranges[valid][front_cone] < stop_range):
+                    front_blocked = True
+
+            if elapsed_phase < self.random_walk_phase_dur and not front_blocked:
+                cmd.linear.x = rw_lin
+                self.cmd_pub.publish(cmd)
+            else:
+                self.cmd_pub.publish(Twist())
+
+            # Check if total random walk time is up
+            if now_s - self.random_walk_start >= rw_dur:
                 self.cmd_pub.publish(Twist())
                 self.pose_history.clear()
-                self.set_state(FIND_FRONTIER)
+                self.set_state(FIND_FRONTIER, "random walk complete")
+                return
 
-    def _open_side_direction(self) -> float:
-        """Return +1.0 to turn left, -1.0 to turn right, based on LiDAR."""
-        if self.scan is None:
-            return 1.0
+            # If this drive phase is done, start a new turn
+            if elapsed_phase >= self.random_walk_phase_dur or front_blocked:
+                self.recovery_phase = 1
+                self.recovery_start = now_s
+                self._new_random_walk_step()
 
-        ranges = np.array(self.scan.ranges, dtype=np.float64)
-        angles = self.scan.angle_min + np.arange(len(ranges), dtype=np.float64) * self.scan.angle_increment
-
-        valid = np.isfinite(ranges) & (ranges > 0.0)
-        ranges = ranges[valid]
-        angles = angles[valid]
-
-        if ranges.size == 0:
-            return 1.0
-
-        # Replace inf/nan (already filtered) — cap at max range for summing
-        max_r = float(np.max(ranges))
-        capped = np.minimum(ranges, max_r)
-
-        left_mask = angles > 0.0
-        right_mask = angles < 0.0
-        left_sum = float(np.sum(capped[left_mask])) if np.any(left_mask) else 0.0
-        right_sum = float(np.sum(capped[right_mask])) if np.any(right_mask) else 0.0
-
-        return 1.0 if left_sum >= right_sum else -1.0
+    def _new_random_walk_step(self):
+        """Pick a new random turn direction and duration."""
+        self.random_walk_turn_dir = random.choice([-1.0, 1.0])
+        self.random_walk_phase_dur = random.uniform(0.5, 1.5)
 
 
 def main():
