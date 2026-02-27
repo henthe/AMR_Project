@@ -186,7 +186,7 @@ class FrontierPotentialFieldExplorer(Node):
         # ----- Timer: 20 Hz control loop -----
         self.timer = self.create_timer(0.05, self.control_loop)
 
-        self.get_logger().info("FrontierPotentialFieldExplorer started.")
+        print("FrontierPotentialFieldExplorer started.")
 
     # ================================================================ #
     #  Callbacks
@@ -577,7 +577,7 @@ class FrontierPotentialFieldExplorer(Node):
             )
             if reason:
                 msg += f" {reason}"
-            self.get_logger().info(msg)
+            print(msg)
             self.state = new_state
 
     # ================================================================ #
@@ -595,7 +595,7 @@ class FrontierPotentialFieldExplorer(Node):
                 f"({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})"
                 if self.current_goal else "none"
             )
-            self.get_logger().info(
+            print(
                 f"Status: {_STATE_NAMES.get(self.state, '?')} | "
                 f"pos={pos_str} goal={goal_str} | "
                 f"wp={self.wp_index}/{len(self.waypoints_world)} "
@@ -727,9 +727,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         # Stuck detection
         if self.check_stuck(x, y):
-            self.get_logger().warn(
-                f"STUCK at ({x:.2f}, {y:.2f}) — starting random walk"
-            )
+            print(f"[STUCK] at ({x:.2f}, {y:.2f}) — starting random walk")
             self.recovery_start = now_s
             self.recovery_phase = 0
             self.random_walk_start = None
@@ -744,8 +742,8 @@ class FrontierPotentialFieldExplorer(Node):
         if self.front_blocked_since is not None:
             blocked_dur = now_s - self.front_blocked_since
             if blocked_dur > 2.0:
-                self.get_logger().warn(
-                    f"STUCK (front blocked {blocked_dur:.1f}s) at "
+                print(
+                    f"[STUCK] front blocked {blocked_dur:.1f}s at "
                     f"({x:.2f}, {y:.2f}) — starting random walk"
                 )
                 self.recovery_start = now_s
@@ -936,6 +934,7 @@ class FrontierPotentialFieldExplorer(Node):
                 self.random_walk_start = now_s
                 self.recovery_start = now_s
                 self._new_random_walk_step()
+                print("[RECOVERY] Random walk started")
                 return
 
         # Phase 1: random turn
