@@ -819,6 +819,10 @@ class FrontierPotentialFieldExplorer(Node):
         dy_r = s * dx_w + c * dy_w
 
         F_att = np.array([k_att * dx_r, k_att * dy_r], dtype=np.float64)
+        # Cap attractive force so it can never overwhelm repulsion
+        att_mag = np.linalg.norm(F_att)
+        if att_mag > 1.0:
+            F_att = F_att / att_mag * 1.0
 
         # Repulsive forces from LaserScan
         scan = self.scan
