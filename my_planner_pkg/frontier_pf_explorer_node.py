@@ -136,6 +136,7 @@ class FrontierPotentialFieldExplorer(Node):
         # Navigation
         self.current_goal: Optional[Tuple[float, float]] = None
         self.waypoints_world: List[Tuple[float, float]] = []
+        self.last_path_cells: list = []
         self.wp_index: int = 0
         self.last_goal_select_time: float = 0.0
 
@@ -148,6 +149,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         # Front-blocked tracking (corner detection)
         self.front_blocked_since: Optional[float] = None
+        self.last_status_log: float = 0.0
 
         # Recovery
         self.recovery_start: Optional[float] = None
@@ -405,15 +407,10 @@ class FrontierPotentialFieldExplorer(Node):
         start = self._nearest_free(planning_grid, start)
         goal = self._nearest_free(planning_grid, goal)
         if start is None or goal is None:
-            self.get_logger().warn(
-                f"No free cell near {'start' if start is None else 'goal'} "
-                f"(robot={rx:.2f},{ry:.2f}  target={goal_x:.2f},{goal_y:.2f})"
-            )
             return False
 
         path = astar(planning_grid, start, goal, allow_diagonal=True)
         if path is None:
-            self.get_logger().warn("A* failed: no path to frontier goal.")
             return False
 
         every_n = int(self.get_parameter("waypoint_every_n_cells").value)
@@ -426,15 +423,12 @@ class FrontierPotentialFieldExplorer(Node):
             for (r, c) in wp_cells
         ]
         self.wp_index = 0
+        self.last_path_cells = list(path)
 
-        self.get_logger().info(
-            f"Planned path: {len(path)} cells, {len(self.waypoints_world)} waypoints "
-            f"to ({goal_x:.2f}, {goal_y:.2f})"
-        )
-        self.publish_markers(path)
+        self.publish_markers()
         return True
 
-    def publish_markers(self, path_cells: list):
+    def publish_markers(self):
         """Publish A* path + waypoints + goal marker for RViz."""
         ma = MarkerArray()
         frame = self.get_parameter("map_frame").value
@@ -448,10 +442,11 @@ class FrontierPotentialFieldExplorer(Node):
         path_m.id = 0
         path_m.type = Marker.LINE_STRIP
         path_m.action = Marker.ADD
+        path_m.pose.orientation.w = 1.0
         path_m.scale.x = 0.03
         path_m.color.g = 1.0
         path_m.color.a = 1.0
-        for (r, c) in path_cells:
+        for (r, c) in self.last_path_cells:
             x, y = occ_grid_to_world(
                 r, c, self.map_origin_x, self.map_origin_y, self.map_resolution
             )
@@ -466,6 +461,7 @@ class FrontierPotentialFieldExplorer(Node):
         wps_m.id = 1
         wps_m.type = Marker.SPHERE_LIST
         wps_m.action = Marker.ADD
+        wps_m.pose.orientation.w = 1.0
         wps_m.scale.x = 0.10
         wps_m.scale.y = 0.10
         wps_m.scale.z = 0.10
@@ -493,6 +489,7 @@ class FrontierPotentialFieldExplorer(Node):
             goal_m.color.a = 1.0
             goal_m.pose.position.x = self.current_goal[0]
             goal_m.pose.position.y = self.current_goal[1]
+            goal_m.pose.orientation.w = 1.0
             ma.markers.append(goal_m)
 
         self.marker_pub.publish(ma)
@@ -566,12 +563,15 @@ class FrontierPotentialFieldExplorer(Node):
     # ================================================================ #
     #  State transitions
     # ================================================================ #
-    def set_state(self, new_state: int):
+    def set_state(self, new_state: int, reason: str = ""):
         if new_state != self.state:
-            self.get_logger().info(
-                f"State: {_STATE_NAMES.get(self.state, '?')} -> "
-                f"{_STATE_NAMES.get(new_state, '?')}"
+            msg = (
+                f"[{_STATE_NAMES.get(self.state, '?')} -> "
+                f"{_STATE_NAMES.get(new_state, '?')}]"
             )
+            if reason:
+                msg += f" {reason}"
+            self.get_logger().info(msg)
             self.state = new_state
 
     # ================================================================ #
@@ -579,6 +579,24 @@ class FrontierPotentialFieldExplorer(Node):
     # ================================================================ #
     def control_loop(self):
         now_s = self.get_clock().now().nanoseconds * 1e-9
+
+        # Periodic status log + marker republish (every ~5s)
+        if now_s - self.last_status_log > 5.0:
+            self.last_status_log = now_s
+            pose = self.get_robot_pose()
+            pos_str = f"({pose[0]:.2f}, {pose[1]:.2f})" if pose else "unknown"
+            goal_str = (
+                f"({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})"
+                if self.current_goal else "none"
+            )
+            self.get_logger().info(
+                f"Status: {_STATE_NAMES.get(self.state, '?')} | "
+                f"pos={pos_str} goal={goal_str} | "
+                f"wp={self.wp_index}/{len(self.waypoints_world)} "
+                f"bl={len(self.blacklisted_goals)}"
+            )
+            if self.last_path_cells:
+                self.publish_markers()
 
         # ---- WARMUP ----
         if self.state == WARMUP:
@@ -633,42 +651,36 @@ class FrontierPotentialFieldExplorer(Node):
         clusters = self.find_frontiers()
 
         if not clusters:
-            # Try clearing blacklist and re-checking
             if self.blacklisted_goals:
-                self.get_logger().info(
-                    "No frontiers with blacklist; clearing blacklist and retrying."
-                )
                 self.blacklisted_goals.clear()
                 clusters = self.find_frontiers()
 
         if not clusters:
-            self.get_logger().info("No frontier clusters found. Exploration complete!")
-            self.set_state(DONE)
+            self.set_state(DONE, "no frontiers remain")
             return
 
         goal = self.select_frontier_goal(clusters, rx, ry)
         if goal is None:
-            self.get_logger().info("All frontier goals blacklisted; clearing blacklist.")
             self.blacklisted_goals.clear()
             goal = self.select_frontier_goal(clusters, rx, ry)
 
         if goal is None:
-            self.get_logger().info("No reachable frontier goal. Exploration complete!")
-            self.set_state(DONE)
+            self.set_state(DONE, "no reachable frontier")
             return
 
         self.current_goal = goal
-        self.get_logger().info(f"Frontier goal: ({goal[0]:.2f}, {goal[1]:.2f})")
 
         if self.plan_to_goal(goal[0], goal[1]):
             self.last_goal_select_time = now_s
             self.pose_history.clear()
             self.navigate_start_time = now_s
-            self.set_state(NAVIGATE)
+            self.set_state(
+                NAVIGATE,
+                f"goal=({goal[0]:.2f},{goal[1]:.2f}) "
+                f"{len(self.waypoints_world)}wp"
+            )
         else:
-            # Blacklist unreachable goal and try again next tick
             self.blacklisted_goals.append(goal)
-            self.get_logger().warn("Path planning failed; blacklisting goal.")
 
     # ================================================================ #
     #  NAVIGATE logic
@@ -686,8 +698,7 @@ class FrontierPotentialFieldExplorer(Node):
         # Periodic frontier reselection
         reselect_s = float(self.get_parameter("reselect_goal_every_s").value)
         if now_s - self.last_goal_select_time > reselect_s:
-            self.get_logger().info("Periodic frontier reselection.")
-            self.set_state(FIND_FRONTIER)
+            self.set_state(FIND_FRONTIER, "periodic reselection")
             return
 
         # Check if goal reached (or close enough)
@@ -697,50 +708,37 @@ class FrontierPotentialFieldExplorer(Node):
                 self.current_goal[0] - x, self.current_goal[1] - y
             )
             if dist_to_goal < goal_dist:
-                self.get_logger().info(
-                    f"Frontier goal reached at ({x:.2f}, {y:.2f})."
-                )
-                self.set_state(FIND_FRONTIER)
+                self.set_state(FIND_FRONTIER, "goal reached")
                 return
-            # Close enough: if within 3× reach distance, SLAM has likely
-            # observed the frontier area — move on instead of fighting walls
             if dist_to_goal < goal_dist * 3.0 and now_s - self.navigate_start_time > 5.0:
-                self.get_logger().info(
-                    f"Close enough to frontier ({dist_to_goal:.2f}m); moving on."
-                )
-                self.set_state(FIND_FRONTIER)
+                self.set_state(FIND_FRONTIER, f"close enough ({dist_to_goal:.2f}m)")
                 return
 
         # Check if all waypoints exhausted
         if not self.waypoints_world or self.wp_index >= len(self.waypoints_world):
-            self.get_logger().info("Waypoints exhausted; reselecting frontier.")
-            self.set_state(FIND_FRONTIER)
+            self.set_state(FIND_FRONTIER, "waypoints exhausted")
             return
 
         # Stuck detection
         if self.check_stuck(x, y):
-            self.get_logger().warn("Robot appears stuck; entering recovery.")
             self.recovery_start = now_s
             self.recovery_phase = 0
             self.front_blocked_since = None
             if self.current_goal is not None:
                 self.blacklisted_goals.append(self.current_goal)
-            self.set_state(RECOVERY)
+            self.set_state(RECOVERY, "stuck detected")
             return
 
         # Corner detection: front blocked for too long → recovery
         if self.front_blocked_since is not None:
             blocked_dur = now_s - self.front_blocked_since
             if blocked_dur > 2.0:
-                self.get_logger().warn(
-                    f"Front blocked for {blocked_dur:.1f}s (corner); entering recovery."
-                )
                 self.recovery_start = now_s
                 self.recovery_phase = 0
                 self.front_blocked_since = None
                 if self.current_goal is not None:
                     self.blacklisted_goals.append(self.current_goal)
-                self.set_state(RECOVERY)
+                self.set_state(RECOVERY, f"front blocked {blocked_dur:.1f}s")
                 return
 
         # Waypoint advancement (skip passed waypoints)
