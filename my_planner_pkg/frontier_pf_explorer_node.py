@@ -613,7 +613,7 @@ class FrontierPotentialFieldExplorer(Node):
             self.set_state(FIND_FRONTIER)
             return
 
-        # Check if goal reached
+        # Check if goal reached (or close enough)
         goal_dist = float(self.get_parameter("goal_reached_dist_m").value)
         if self.current_goal is not None:
             dist_to_goal = math.hypot(
@@ -622,6 +622,14 @@ class FrontierPotentialFieldExplorer(Node):
             if dist_to_goal < goal_dist:
                 self.get_logger().info(
                     f"Frontier goal reached at ({x:.2f}, {y:.2f})."
+                )
+                self.set_state(FIND_FRONTIER)
+                return
+            # Close enough: if within 3× reach distance, SLAM has likely
+            # observed the frontier area — move on instead of fighting walls
+            if dist_to_goal < goal_dist * 3.0 and now_s - self.navigate_start_time > 5.0:
+                self.get_logger().info(
+                    f"Close enough to frontier ({dist_to_goal:.2f}m); moving on."
                 )
                 self.set_state(FIND_FRONTIER)
                 return
@@ -755,16 +763,12 @@ class FrontierPotentialFieldExplorer(Node):
 
         ang = clamp(k_heading * heading_err, -max_ang, max_ang)
 
-        heading_factor = math.cos(heading_err)
-        if heading_factor >= 0.0:
-            lin = clamp(0.6 * heading_factor * max_lin, 0.0, max_lin)
-        else:
-            # Net force points backward — allow slow reverse
-            lin = clamp(0.3 * heading_factor * max_lin, -0.1, 0.0)
+        heading_factor = max(0.0, math.cos(heading_err))
+        lin = clamp(0.6 * heading_factor * max_lin, 0.0, max_lin)
 
-        # Front-blocked: slow backward creep to escape (not a hard stop)
+        # Front-blocked: stop forward motion, rotation continues
         if front_blocked:
-            lin = -0.05
+            lin = 0.0
 
         cmd = Twist()
         cmd.linear.x = float(lin)
