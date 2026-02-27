@@ -94,9 +94,9 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("repulsion_range_m", 0.5)
         self.declare_parameter("stop_range_m", 0.20)
 
-        self.declare_parameter("k_heading", 1.8)
-        self.declare_parameter("max_lin", 0.3)
-        self.declare_parameter("max_ang", 1.0)
+        self.declare_parameter("k_heading", 2.5)
+        self.declare_parameter("max_lin", 0.5)
+        self.declare_parameter("max_ang", 1.5)
 
         self.declare_parameter("goal_reached_dist_m", 0.35)
         self.declare_parameter("min_frontier_cluster_size", 5)
@@ -105,7 +105,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.declare_parameter("reselect_goal_every_s", 10.0)
         self.declare_parameter("warmup_duration_s", 5.0)
-        self.declare_parameter("warmup_angular_speed", 0.5)
+        self.declare_parameter("warmup_angular_speed", 0.8)
 
         self.declare_parameter("waypoint_every_n_cells", 20)
         self.declare_parameter("stuck_window_s", 5.0)
@@ -115,7 +115,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("recovery_back_duration_s", 1.0)
         self.declare_parameter("recovery_turn_duration_s", 1.5)
         self.declare_parameter("recovery_back_speed", -0.15)
-        self.declare_parameter("recovery_turn_speed", 0.8)
+        self.declare_parameter("recovery_turn_speed", 1.2)
 
         # ----- State -----
         self.state = WARMUP
@@ -764,7 +764,7 @@ class FrontierPotentialFieldExplorer(Node):
         ang = clamp(k_heading * heading_err, -max_ang, max_ang)
 
         heading_factor = max(0.0, math.cos(heading_err))
-        lin = clamp(0.6 * heading_factor * max_lin, 0.0, max_lin)
+        lin = clamp(heading_factor * max_lin, 0.0, max_lin)
 
         # Front-blocked: stop forward motion, rotation continues
         if front_blocked:
