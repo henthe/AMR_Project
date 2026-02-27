@@ -91,9 +91,9 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.declare_parameter("inflation_radius_m", 0.35)
         self.declare_parameter("k_att", 1.0)
-        self.declare_parameter("k_rep", 0.8)
-        self.declare_parameter("repulsion_range_m", 0.5)
-        self.declare_parameter("stop_range_m", 0.20)
+        self.declare_parameter("k_rep", 1.5)
+        self.declare_parameter("repulsion_range_m", 0.7)
+        self.declare_parameter("stop_range_m", 0.25)
 
         self.declare_parameter("k_heading", 2.5)
         self.declare_parameter("max_lin", 0.5)
@@ -839,6 +839,12 @@ class FrontierPotentialFieldExplorer(Node):
 
         heading_factor = max(0.0, math.cos(heading_err))
         lin = clamp(heading_factor * max_lin, 0.0, max_lin)
+
+        # Proximity speed scaling: slow down near obstacles
+        if rr.size > 0:
+            min_range = float(np.min(rr))
+            proximity_factor = clamp(min_range / rep_range, 0.2, 1.0)
+            lin *= proximity_factor
 
         # Front-blocked: stop forward motion, rotation continues
         if front_blocked:
