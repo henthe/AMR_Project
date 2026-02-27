@@ -330,8 +330,9 @@ class FrontierPotentialFieldExplorer(Node):
             return None
 
         grid = np.copy(self.map_grid)
-        # Unknown → obstacle for safe planning
-        grid[grid == -1] = 100
+        # Unknown → FREE for exploration (robot must drive into unknown space;
+        # safety is handled by the LiDAR-based potential field, not the planner)
+        grid[grid == -1] = 0
         # Any positive value → obstacle
         grid[grid > 0] = 100
         # Free stays 0
@@ -398,6 +399,10 @@ class FrontierPotentialFieldExplorer(Node):
         start = self._nearest_free(planning_grid, start)
         goal = self._nearest_free(planning_grid, goal)
         if start is None or goal is None:
+            self.get_logger().warn(
+                f"No free cell near {'start' if start is None else 'goal'} "
+                f"(robot={rx:.2f},{ry:.2f}  target={goal_x:.2f},{goal_y:.2f})"
+            )
             return False
 
         path = astar(planning_grid, start, goal, allow_diagonal=True)
