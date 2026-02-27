@@ -93,7 +93,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("k_att", 1.0)
         self.declare_parameter("k_rep", 1.5)
         self.declare_parameter("repulsion_range_m", 0.7)
-        self.declare_parameter("stop_range_m", 0.25)
+        self.declare_parameter("stop_range_m", 0.30)
 
         self.declare_parameter("k_heading", 2.5)
         self.declare_parameter("max_lin", 0.5)
@@ -812,7 +812,7 @@ class FrontierPotentialFieldExplorer(Node):
         angles = angles[valid]
 
         # Front-blocked rotation: suppress linear but keep rotating
-        front_cone = np.abs(angles) < math.radians(35.0)
+        front_cone = np.abs(angles) < math.radians(50.0)
         front_blocked = bool(np.any(ranges[front_cone] < stop_range))
 
         F_rep = np.zeros(2, dtype=np.float64)
@@ -870,7 +870,7 @@ class FrontierPotentialFieldExplorer(Node):
         # Proximity speed scaling: slow down near obstacles
         if rr.size > 0:
             min_range = float(np.min(rr))
-            proximity_factor = clamp(min_range / rep_range, 0.2, 1.0)
+            proximity_factor = clamp(min_range / rep_range, 0.05, 1.0)
             lin *= proximity_factor
 
         # Front-blocked: stop forward motion, rotation continues
