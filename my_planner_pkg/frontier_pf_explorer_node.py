@@ -109,7 +109,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.declare_parameter("waypoint_every_n_cells", 20)
         self.declare_parameter("stuck_window_s", 5.0)
-        self.declare_parameter("stuck_threshold_m", 0.15)
+        self.declare_parameter("stuck_threshold_m", 0.08)
         self.declare_parameter("goal_blacklist_radius_m", 0.5)
 
         self.declare_parameter("recovery_back_duration_s", 1.0)
@@ -742,7 +742,7 @@ class FrontierPotentialFieldExplorer(Node):
             dot = float(np.dot(F_att / att_norm, F_rep / rep_norm))
             if dot < -0.3:
                 tangent = np.array([-F_rep[1], F_rep[0]], dtype=np.float64)
-                F_rep = F_rep + 0.5 * tangent
+                F_rep = F_rep + 1.0 * tangent
 
         F = F_att + F_rep
 
@@ -755,12 +755,16 @@ class FrontierPotentialFieldExplorer(Node):
 
         ang = clamp(k_heading * heading_err, -max_ang, max_ang)
 
-        heading_factor = max(0.0, math.cos(heading_err))
-        lin = clamp(0.6 * heading_factor * max_lin, 0.0, max_lin)
+        heading_factor = math.cos(heading_err)
+        if heading_factor >= 0.0:
+            lin = clamp(0.6 * heading_factor * max_lin, 0.0, max_lin)
+        else:
+            # Net force points backward — allow slow reverse
+            lin = clamp(0.3 * heading_factor * max_lin, -0.1, 0.0)
 
-        # Front-blocked: allow rotation but suppress forward motion
+        # Front-blocked: slow backward creep to escape (not a hard stop)
         if front_blocked:
-            lin = 0.0
+            lin = -0.05
 
         cmd = Twist()
         cmd.linear.x = float(lin)
