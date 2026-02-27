@@ -600,6 +600,15 @@ class FrontierPotentialFieldExplorer(Node):
         if abs(heading_err) > math.radians(50.0):
             lin = max(lin, self.min_lin_when_turning)
 
+        # Gradually slow down when obstacles are close in the front hemisphere
+        front_hemi = np.abs(angles) < math.radians(90.0)
+        front_ranges = ranges[front_hemi]
+        if front_ranges.size > 0:
+            min_front = float(np.min(front_ranges))
+            if min_front < self.rep_range:
+                prox = max(0.0, (min_front - self.stop_range) / (self.rep_range - self.stop_range))
+                lin *= prox
+
         # Front blocked: stop forward motion but keep turning to escape
         if front_blocked:
             lin = 0.0
