@@ -90,7 +90,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("base_frame", "base_link")
 
-        self.declare_parameter("inflation_radius_m", 0.35)
+        self.declare_parameter("inflation_radius_m", 0.50)
         self.declare_parameter("k_att", 1.0)
         self.declare_parameter("k_rep", 1.5)
         self.declare_parameter("repulsion_range_m", 0.7)
@@ -102,8 +102,6 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.declare_parameter("goal_reached_dist_m", 0.35)
         self.declare_parameter("min_frontier_cluster_size", 5)
-        self.declare_parameter("score_size_weight", 0.3)
-        self.declare_parameter("score_distance_weight", 2.0)
 
         self.declare_parameter("reselect_goal_every_s", 5.0)
         self.declare_parameter("warmup_duration_s", 5.0)
@@ -300,16 +298,13 @@ class FrontierPotentialFieldExplorer(Node):
     def select_frontier_goal(
         self, clusters: List[List[Tuple[int, int]]], robot_x: float, robot_y: float
     ) -> Optional[Tuple[float, float]]:
-        """Score clusters and return best centroid in world coords, or None."""
-        w_size = float(self.get_parameter("score_size_weight").value)
-        w_dist = float(self.get_parameter("score_distance_weight").value)
+        """Pick the closest non-blacklisted frontier cluster centroid."""
         bl_radius = float(self.get_parameter("goal_blacklist_radius_m").value)
 
-        best_score = -float("inf")
+        best_dist = float("inf")
         best_goal: Optional[Tuple[float, float]] = None
 
         for cluster in clusters:
-            # Centroid in grid coords
             rows = [c[0] for c in cluster]
             cols = [c[1] for c in cluster]
             cr = int(np.mean(rows))
@@ -328,9 +323,8 @@ class FrontierPotentialFieldExplorer(Node):
                 continue
 
             dist = math.hypot(gx - robot_x, gy - robot_y)
-            score = w_size * len(cluster) - w_dist * dist
-            if score > best_score:
-                best_score = score
+            if dist < best_dist:
+                best_dist = dist
                 best_goal = (gx, gy)
 
         return best_goal
@@ -674,12 +668,23 @@ class FrontierPotentialFieldExplorer(Node):
             self.set_state(DONE, "no reachable frontier")
             return
 
+        # Check if this is the same goal as before (periodic reselection picked
+        # the same frontier).  In that case, keep stuck-detection state so the
+        # robot can still be declared stuck across reselections.
+        same_goal = (
+            self.current_goal is not None
+            and math.hypot(goal[0] - self.current_goal[0],
+                           goal[1] - self.current_goal[1]) < 0.5
+        )
+
         self.current_goal = goal
 
         if self.plan_to_goal(goal[0], goal[1]):
             self.last_goal_select_time = now_s
-            self.pose_history.clear()
-            self.navigate_start_time = now_s
+            if not same_goal:
+                # Genuinely new goal → reset stuck detection
+                self.pose_history.clear()
+                self.navigate_start_time = now_s
             self.set_state(
                 NAVIGATE,
                 f"goal=({goal[0]:.2f},{goal[1]:.2f}) "

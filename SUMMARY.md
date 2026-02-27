@@ -78,7 +78,7 @@ AMR_Project/                          # ROS 2 ament_python package root
   8. **Proximity speed scaling:** linear speed is scaled by `min_range / repulsion_range` (floor 0.05), so the robot slows down near obstacles proportionally.
   9. **Stuck detection:** checks both total distance traveled AND net displacement (straight-line start→end) over a sliding time window. Net displacement catches oscillation where total distance accumulates but no progress is made.
   10. **Recovery (random walk):** back up briefly (−0.15 m/s, 1 s), then perform a random walk — alternating random turns (random direction, 0.5–1.5 s) and forward drives (0.25 m/s, 0.5–1.5 s) for `random_walk_duration_s` (5 s). Forward drives are skipped when the front is blocked. Stuck events are logged at WARN level with position.
-  11. **Periodic reselection:** every `reselect_goal_every_s` (5 s), re-evaluates frontier goals using the latest SLAM map, adapting to newly discovered areas.
+  11. **Periodic reselection:** every `reselect_goal_every_s` (5 s), re-evaluates frontier goals using the latest SLAM map, adapting to newly discovered areas. When the same goal is reselected (within 0.5 m), stuck-detection state (pose history and navigate start time) is preserved across reselections so stuck detection can still trigger.
   12. **Blacklist management:** unreachable or stuck-at goals are blacklisted; blacklist is cleared if all candidates become blacklisted.
   13. **RViz visualization:** publishes MarkerArray on `/explorer_markers` — green LINE_STRIP for A* path, red SPHERE_LIST for waypoints, blue SPHERE for current goal. Republished every ~5 s.
   14. **Periodic status logging:** consolidated log every ~5 s with state, position, goal, waypoint progress, blacklist count.
