@@ -1,40 +1,37 @@
 # Project Guidelines
 
-- This repo is a university project
+- This repo is a university project (AMR — Autonomous Mobile Robots)
 - The code needs to work; coding tests or advanced use cases are not required
 - Keep the code simple and clean
 - For ROS2 documentation, use the Context7 MCP server
 
+# Assignments
+
+The project has three assignments (see README.md for full descriptions):
+
+1. **Path & Motion Planning** (SOLVED) — `my_planner_pkg/planner_pf_node.py`
+   - A* global planner + potential field local planner with waypoint following
+   - Loads a static map from YAML, plans A* path, extracts waypoints, follows them with attractive/repulsive potential fields using LaserScan
+
+2. **Localisation** (SOLVED) — `my_planner_pkg/particle_filter_localization.py`
+   - Monte Carlo Localization (particle filter)
+   - Thrun et al. motion model, beam-based measurement model with raycast, systematic resampling with random injection
+
+3. **Environment Exploration** (CURRENT) 
+   - Frontier-based exploration combined with SLAM (slam_toolbox)
+   - Select poses at the boundary between explored and unexplored regions
+   - **IMPORTANT: Must build on Assignment 1's solution** (`planner_pf_node.py`) — reuse/adapt the potential field planner for navigating to frontier goals
+
 # Active Focus
 
-- The only actively developed node is `my_planner_pkg/frontier_pf_explorer_node.py` — other nodes are not currently in use
+- The actively developed node is (Assignment 3)
+- `planner_pf_node.py` is the foundation to build upon for the explorer's navigation
 
 # Testing
 
 - ROS 2 is **not installed** on this development PC — code cannot be built or run here
 - Code will be tested on a separate machine afterwards
 - Because of this: after finishing any coding task, **always re-read and carefully verify** the changed code to make sure it will work (correct imports, matching topic names, proper types, no typos, consistent logic)
-
-## Test commands (run on the ROS 2 machine)
-
-Terminal 1 — SLAM Toolbox (online async mapping mode):
-```
-ros2 launch slam_toolbox online_async_launch.py use_sim_time:=true
-```
-
-Terminal 2 — Frontier explorer:
-```
-ros2 run my_planner_pkg frontier_pf_explorer --ros-args \
-  -p use_sim_time:=true \
-  -p max_lin:=0.75 \
-  -p max_ang:=2.0 \
-  -p reselect_goal_every_s:=2.5 \
-  -p k_rep:=1.15 \
-  -p repulsion_range_m:=0.90 \
-  -p stop_range_m:=0.22 \
-  -p k_att:=0.85 \
-  -p lin_scale_on_heading:=1.4
-```
 
 # Summary File
 

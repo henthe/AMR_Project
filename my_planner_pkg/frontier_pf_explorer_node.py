@@ -1,340 +1,206 @@
 #!/usr/bin/env python3
+"""
+Frontier-based exploration with potential field navigation.
+
+Subscribes to the SLAM map (/map), detects frontier cells (free cells adjacent
+to unknown space), clusters them, selects the best frontier goal, plans an A*
+path, and navigates using an attractive/repulsive potential field controller.
+
+Builds on Assignment 1 (planner_pf_node.py) — reuses A*, waypoint extraction,
+and the potential field concept.
+"""
+
 import math
-import time
 from collections import deque
-from typing import List, Tuple, Optional, Set
+from typing import List, Tuple, Optional
 
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.duration import Duration
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, qos_profile_sensor_data
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+    qos_profile_sensor_data,
+)
 
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist
 
 import tf2_ros
 from tf2_ros import TransformException
 from tf_transformations import euler_from_quaternion
 
+# Reuse planning utilities from Assignment 1
+from my_planner_pkg.planner_pf_node import (
+    astar,
+    extract_waypoints,
+    clamp,
+    wrap_angle,
+)
 
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+
+# ------------------------------------------------------------------ #
+# Coordinate transforms for OccupancyGrid (no Y-flip, unlike PGM)
+# ------------------------------------------------------------------ #
+def occ_world_to_grid(
+    x: float, y: float, origin_x: float, origin_y: float, resolution: float
+) -> Tuple[int, int]:
+    col = int(math.floor((x - origin_x) / resolution))
+    row = int(math.floor((y - origin_y) / resolution))
+    return (row, col)
 
 
-def wrap_angle(a: float) -> float:
-    while a > math.pi:
-        a -= 2.0 * math.pi
-    while a < -math.pi:
-        a += 2.0 * math.pi
-    return a
+def occ_grid_to_world(
+    row: int, col: int, origin_x: float, origin_y: float, resolution: float
+) -> Tuple[float, float]:
+    x = origin_x + (col + 0.5) * resolution
+    y = origin_y + (row + 0.5) * resolution
+    return (x, y)
+
+
+# ------------------------------------------------------------------ #
+# State constants
+# ------------------------------------------------------------------ #
+WARMUP = 0
+FIND_FRONTIER = 1
+NAVIGATE = 2
+RECOVERY = 3
+DONE = 4
+
+_STATE_NAMES = {
+    WARMUP: "WARMUP",
+    FIND_FRONTIER: "FIND_FRONTIER",
+    NAVIGATE: "NAVIGATE",
+    RECOVERY: "RECOVERY",
+    DONE: "DONE",
+}
 
 
 class FrontierPotentialFieldExplorer(Node):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__("frontier_pf_explorer")
 
-        self.declare_parameter("map_topic", "/map")
-        self.declare_parameter("scan_topic", "/scan")
-        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
-
-        self.declare_parameter("global_frame", "map")
+        # ----- Parameters -----
+        self.declare_parameter("map_frame", "map")
         self.declare_parameter("base_frame", "base_link")
 
-        self.declare_parameter("free_threshold", 20)
-        self.declare_parameter("min_frontier_cluster_size", 10)
+        self.declare_parameter("inflation_radius_m", 0.35)
+        self.declare_parameter("k_att", 1.0)
+        self.declare_parameter("k_rep", 0.8)
+        self.declare_parameter("repulsion_range_m", 0.5)
+        self.declare_parameter("stop_range_m", 0.20)
 
-        self.declare_parameter("goal_blacklist_radius_m", 0.25)
-        self.declare_parameter("blacklist_max_size", 80)
-
-        self.declare_parameter("min_map_size_x_m", 2.0)
-        self.declare_parameter("min_map_size_y_m", 2.0)
-
-        self.declare_parameter("warmup_enable", True)
-        self.declare_parameter("warmup_max_duration_s", 45.0)
-        self.declare_parameter("warmup_linear_x", 0.08)
-        self.declare_parameter("warmup_angular_z", 0.55)
+        self.declare_parameter("k_heading", 1.8)
+        self.declare_parameter("max_lin", 0.3)
+        self.declare_parameter("max_ang", 1.0)
 
         self.declare_parameter("goal_reached_dist_m", 0.35)
-        self.declare_parameter("min_goal_separation_m", 0.60)
-        self.declare_parameter("goal_timeout_s", 180.0)
+        self.declare_parameter("min_frontier_cluster_size", 5)
+        self.declare_parameter("score_size_weight", 2.0)
+        self.declare_parameter("score_distance_weight", 0.6)
 
-        self.declare_parameter("k_att", 0.85)
-        self.declare_parameter("k_rep", 1.15)
-        self.declare_parameter("repulsion_range_m", 0.90)
-        self.declare_parameter("stop_range_m", 0.22)
+        self.declare_parameter("reselect_goal_every_s", 10.0)
+        self.declare_parameter("warmup_duration_s", 5.0)
+        self.declare_parameter("warmup_angular_speed", 0.5)
 
-        self.declare_parameter("k_heading", 2.3)
-        self.declare_parameter("max_lin", 0.60)
-        self.declare_parameter("max_ang", 1.8)
-        self.declare_parameter("lin_scale_on_heading", 1.4)
+        self.declare_parameter("waypoint_every_n_cells", 20)
+        self.declare_parameter("stuck_window_s", 5.0)
+        self.declare_parameter("stuck_threshold_m", 0.15)
+        self.declare_parameter("goal_blacklist_radius_m", 0.5)
 
-        self.declare_parameter("stuck_check_enable", True)
-        self.declare_parameter("stuck_grace_s", 5.0)
-        self.declare_parameter("stuck_window_s", 10.0)
-        self.declare_parameter("stuck_min_path_m", 0.18)
+        self.declare_parameter("recovery_back_duration_s", 1.0)
+        self.declare_parameter("recovery_turn_duration_s", 1.5)
+        self.declare_parameter("recovery_back_speed", -0.15)
+        self.declare_parameter("recovery_turn_speed", 0.8)
 
-        self.declare_parameter("reselect_goal_every_s", 3.0)
+        # ----- State -----
+        self.state = WARMUP
+        self.warmup_start: Optional[float] = None
 
-        self.declare_parameter("recovery_enable", True)
-        self.declare_parameter("recovery_backup_s", 1.2)
-        self.declare_parameter("recovery_turn_s", 1.6)
-        self.declare_parameter("recovery_backup_speed", -0.10)
-        self.declare_parameter("recovery_turn_speed", 1.3)
-        self.declare_parameter("max_recoveries_per_goal", 2)
+        # Map from SLAM
+        self.map_grid: Optional[np.ndarray] = None  # (H, W), int16
+        self.map_resolution: float = 0.05
+        self.map_origin_x: float = 0.0
+        self.map_origin_y: float = 0.0
+        self.map_width: int = 0
+        self.map_height: int = 0
 
-        self.declare_parameter("heading_lpf_alpha", 0.25)
-        self.declare_parameter("ang_lpf_alpha", 0.35)
-        self.declare_parameter("min_lin_when_turning", 0.02)
-
-        self.heading_alpha = float(self.get_parameter("heading_lpf_alpha").value)
-        self.ang_alpha = float(self.get_parameter("ang_lpf_alpha").value)
-        self.min_lin_when_turning = float(self.get_parameter("min_lin_when_turning").value)
-
-        self.filtered_heading = 0.0
-        self.filtered_ang = 0.0
-        self.have_filtered = False
-
-        self.map_topic = self.get_parameter("map_topic").value
-        self.scan_topic = self.get_parameter("scan_topic").value
-        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
-
-        self.global_frame = self.get_parameter("global_frame").value
-        self.base_frame = self.get_parameter("base_frame").value
-
-        self.free_threshold = int(self.get_parameter("free_threshold").value)
-        self.min_cluster_size = int(self.get_parameter("min_frontier_cluster_size").value)
-
-        self.blacklist_radius = float(self.get_parameter("goal_blacklist_radius_m").value)
-        self.blacklist_max_size = int(self.get_parameter("blacklist_max_size").value)
-
-        self.min_map_x_m = float(self.get_parameter("min_map_size_x_m").value)
-        self.min_map_y_m = float(self.get_parameter("min_map_size_y_m").value)
-
-        self.warmup_enable = bool(self.get_parameter("warmup_enable").value)
-        self.warmup_max_duration_s = float(self.get_parameter("warmup_max_duration_s").value)
-        self.warmup_linear_x = float(self.get_parameter("warmup_linear_x").value)
-        self.warmup_angular_z = float(self.get_parameter("warmup_angular_z").value)
-
-        self.goal_reached_dist = float(self.get_parameter("goal_reached_dist_m").value)
-        self.min_goal_sep = float(self.get_parameter("min_goal_separation_m").value)
-        self.goal_timeout_s = float(self.get_parameter("goal_timeout_s").value)
-
-        self.k_att = float(self.get_parameter("k_att").value)
-        self.k_rep = float(self.get_parameter("k_rep").value)
-        self.rep_range = float(self.get_parameter("repulsion_range_m").value)
-        self.stop_range = float(self.get_parameter("stop_range_m").value)
-
-        self.k_heading = float(self.get_parameter("k_heading").value)
-        self.max_lin = float(self.get_parameter("max_lin").value)
-        self.max_ang = float(self.get_parameter("max_ang").value)
-        self.lin_scale = float(self.get_parameter("lin_scale_on_heading").value)
-
-        self.stuck_enable = bool(self.get_parameter("stuck_check_enable").value)
-        self.stuck_grace_s = float(self.get_parameter("stuck_grace_s").value)
-        self.stuck_window_s = float(self.get_parameter("stuck_window_s").value)
-        self.stuck_min_path_m = float(self.get_parameter("stuck_min_path_m").value)
-
-        self.reselect_every_s = float(self.get_parameter("reselect_goal_every_s").value)
-
-        self.recovery_enable = bool(self.get_parameter("recovery_enable").value)
-        self.recovery_backup_s = float(self.get_parameter("recovery_backup_s").value)
-        self.recovery_turn_s = float(self.get_parameter("recovery_turn_s").value)
-        self.recovery_backup_speed = float(self.get_parameter("recovery_backup_speed").value)
-        self.recovery_turn_speed = float(self.get_parameter("recovery_turn_speed").value)
-        self.max_recoveries_per_goal = int(self.get_parameter("max_recoveries_per_goal").value)
-
-        self.declare_parameter("progress_window_s", 8.0)
-        self.declare_parameter("progress_min_delta_m", 0.12)
-        self.progress_window_s = float(self.get_parameter("progress_window_s").value)
-        self.progress_min_delta_m = float(self.get_parameter("progress_min_delta_m").value)
-        self.goal_dist_hist = deque(maxlen=400)
-        self.ang_cmd_hist: deque = deque(maxlen=200)
-
-        qos_map = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-        self.map_sub = self.create_subscription(OccupancyGrid, self.map_topic, self.on_map, qos_map)
-        self.scan_sub = self.create_subscription(LaserScan, self.scan_topic, self.on_scan, qos_profile_sensor_data)
-        self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
-
-        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=15.0))
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
-        self.latest_map: Optional[OccupancyGrid] = None
+        # Scan
         self.scan: Optional[LaserScan] = None
 
-        self.in_warmup = self.warmup_enable
-        self.warmup_start_wall_time = time.time()
+        # Navigation
+        self.current_goal: Optional[Tuple[float, float]] = None
+        self.waypoints_world: List[Tuple[float, float]] = []
+        self.wp_index: int = 0
+        self.last_goal_select_time: float = 0.0
 
-        self.current_goal_world: Optional[Tuple[float, float]] = None
-        self.goal_start_wall_time = 0.0
+        # Blacklist
         self.blacklisted_goals: List[Tuple[float, float]] = []
 
-        self.pose_hist: deque = deque(maxlen=400)
+        # Stuck detection
+        self.pose_history: List[Tuple[float, float, float]] = []  # (x, y, stamp)
 
-        self.last_reselect_wall_time = time.time()
+        # Recovery
+        self.recovery_start: Optional[float] = None
+        self.recovery_phase: int = 0  # 0=back, 1=turn
 
-        self.mode = "NORMAL"
-        self.recovery_start_wall_time = 0.0
-        self.recovery_turn_sign = 1.0
-        self.recoveries_this_goal = 0
+        # ----- TF -----
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.loop_count = 0
-        self.status_every_n = 40  # every ~2s at 20Hz
+        # ----- Subscriptions -----
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, "/map", self.on_map, map_qos
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan, "/scan", self.on_scan, qos_profile_sensor_data
+        )
 
-        self.timer = self.create_timer(0.05, self.loop)
-        self.get_logger().info("Frontier PF Explorer started")
+        # ----- Publisher -----
+        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
-    def on_map(self, msg: OccupancyGrid) -> None:
-        self.latest_map = msg
-        if msg.header.frame_id:
-            self.global_frame = msg.header.frame_id
+        # ----- Timer: 20 Hz control loop -----
+        self.timer = self.create_timer(0.05, self.control_loop)
 
-    def on_scan(self, msg: LaserScan) -> None:
+        self.get_logger().info("FrontierPotentialFieldExplorer started.")
+
+    # ================================================================ #
+    #  Callbacks
+    # ================================================================ #
+    def on_map(self, msg: OccupancyGrid):
+        w = msg.info.width
+        h = msg.info.height
+        self.map_resolution = msg.info.resolution
+        self.map_origin_x = msg.info.origin.position.x
+        self.map_origin_y = msg.info.origin.position.y
+        self.map_width = w
+        self.map_height = h
+        # OccupancyGrid data: -1 unknown, 0 free, 1-100 occupied
+        self.map_grid = np.array(msg.data, dtype=np.int16).reshape((h, w))
+
+    def on_scan(self, msg: LaserScan):
         self.scan = msg
 
-    def loop(self) -> None:
-        if self.latest_map is None or self.scan is None:
-            return
-
-        pose = self.get_robot_pose()
-        if pose is None:
-            return
-        rx, ry, yaw = pose
-
-        self.loop_count += 1
-        if self.loop_count % self.status_every_n == 0:
-            self.log_status(rx, ry)
-
-        if self.in_warmup:
-            if self.warmup_done():
-                self.in_warmup = False
-                self.stop_robot()
-                self.get_logger().info("Warmup complete, selecting frontiers")
-            else:
-                self.publish_warmup_cmd()
-            return
-
-        if not self.map_big_enough(self.latest_map):
-            self.stop_robot()
-            return
-
-        if self.mode != "NORMAL":
-            self.run_recovery()
-            return
-
-        if (time.time() - self.last_reselect_wall_time) >= self.reselect_every_s:
-            self.last_reselect_wall_time = time.time()
-            self.current_goal_world = None
-
-        if self.current_goal_world is None:
-            self.pick_new_goal(rx, ry)
-            if self.current_goal_world is None:
-                self.stop_robot()
-            return
-
-        gx, gy = self.current_goal_world
-
-        dist_goal = math.hypot(gx - rx, gy - ry)
-        self.goal_dist_hist.append((time.time(), dist_goal))
-        if dist_goal <= self.goal_reached_dist:
-            self.add_blacklist(gx, gy)
-            self.current_goal_world = None
-            self.recoveries_this_goal = 0
-            self.stop_robot()
-            return
-
-        if time.time() - self.goal_start_wall_time > self.goal_timeout_s:
-            self.add_blacklist(gx, gy)
-            self.current_goal_world = None
-            self.recoveries_this_goal = 0
-            self.stop_robot()
-            return
-
-        if self.stuck_enable:
-            self.update_pose_hist(rx, ry)
-            if (time.time() - self.goal_start_wall_time) >= self.stuck_grace_s and self.is_stuck():
-                if self.recovery_enable and self.recoveries_this_goal < self.max_recoveries_per_goal:
-                    self.start_recovery()
-                    return
-                self.add_blacklist(gx, gy)
-                self.current_goal_world = None
-                self.recoveries_this_goal = 0
-                self.stop_robot()
-                return
-
-        cmd = self.potential_field_cmd(rx, ry, yaw, gx, gy, self.scan)
-
-        # Oscillation detection: rapidly alternating angular commands = corner wiggling
-        self.ang_cmd_hist.append((time.time(), cmd.angular.z))
-        if self.is_oscillating():
-            self.get_logger().warn("Oscillation detected, triggering recovery")
-            self.ang_cmd_hist.clear()
-            self.have_filtered = False
-            if self.recovery_enable and self.recoveries_this_goal < self.max_recoveries_per_goal:
-                self.start_recovery()
-                return
-            self.add_blacklist(gx, gy)
-            self.current_goal_world = None
-            self.recoveries_this_goal = 0
-            self.stop_robot()
-            return
-
-        self.cmd_pub.publish(cmd)
-
-    def warmup_done(self) -> bool:
-        elapsed = time.time() - self.warmup_start_wall_time
-        if elapsed >= self.warmup_max_duration_s:
-            return True
-        if self.latest_map is None:
-            return False
-        return self.map_big_enough(self.latest_map)
-
-    def publish_warmup_cmd(self) -> None:
-        elapsed = time.time() - self.warmup_start_wall_time
-        cmd = Twist()
-        if elapsed < 2.0:
-            cmd.linear.x = -0.06
-            cmd.angular.z = 0.0
-        else:
-            cmd.linear.x = float(self.warmup_linear_x)
-            cmd.angular.z = float(self.warmup_angular_z)
-        self.cmd_pub.publish(cmd)
-
-    def stop_robot(self) -> None:
-        self.cmd_pub.publish(Twist())
-
-    def log_status(self, rx: float, ry: float) -> None:
-        if self.in_warmup:
-            elapsed = time.time() - self.warmup_start_wall_time
-            self.get_logger().info(f"[WARMUP] elapsed={elapsed:.1f}s pos=({rx:.2f},{ry:.2f})")
-            return
-        if self.mode != "NORMAL":
-            self.get_logger().info(
-                f"[{self.mode}] attempt={self.recoveries_this_goal} pos=({rx:.2f},{ry:.2f})")
-            return
-        if self.current_goal_world is None:
-            self.get_logger().info(f"[SEARCHING] pos=({rx:.2f},{ry:.2f}) blacklisted={len(self.blacklisted_goals)}")
-            return
-        gx, gy = self.current_goal_world
-        dist = math.hypot(gx - rx, gy - ry)
-        self.get_logger().info(
-            f"[DRIVING] goal=({gx:.2f},{gy:.2f}) dist={dist:.2f}m pos=({rx:.2f},{ry:.2f})"
-            f" recoveries={self.recoveries_this_goal}")
-
-    def map_big_enough(self, grid: OccupancyGrid) -> bool:
-        sx = float(grid.info.width) * float(grid.info.resolution)
-        sy = float(grid.info.height) * float(grid.info.resolution)
-        return (sx >= self.min_map_x_m) and (sy >= self.min_map_y_m)
-
+    # ================================================================ #
+    #  Robot pose
+    # ================================================================ #
     def get_robot_pose(self) -> Optional[Tuple[float, float, float]]:
+        map_frame = self.get_parameter("map_frame").value
+        base_frame = self.get_parameter("base_frame").value
         try:
-            tfm = self.tf_buffer.lookup_transform(self.global_frame, self.base_frame, rclpy.time.Time())
+            tfm = self.tf_buffer.lookup_transform(
+                map_frame, base_frame, rclpy.time.Time()
+            )
         except TransformException:
             return None
         x = tfm.transform.translation.x
@@ -343,203 +209,501 @@ class FrontierPotentialFieldExplorer(Node):
         yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
         return (x, y, yaw)
 
-    def add_blacklist(self, gx: float, gy: float) -> None:
-        self.blacklisted_goals.append((gx, gy))
-        if len(self.blacklisted_goals) > self.blacklist_max_size:
-            self.blacklisted_goals.pop(0)
-
-    def blacklist_effective_radius(self) -> float:
-        grid = self.latest_map
-        r = self.blacklist_radius
-        if grid is not None:
-            sx = float(grid.info.width) * float(grid.info.resolution)
-            sy = float(grid.info.height) * float(grid.info.resolution)
-            map_scale = max(1.0, min(sx, sy))
-            r = min(r, 0.15 * map_scale)
-            r = max(0.10, r)
-        return r
-
-    def is_blacklisted_world(self, wx: float, wy: float) -> bool:
-        r = self.blacklist_effective_radius()
-        for bx, by in self.blacklisted_goals:
-            if math.hypot(wx - bx, wy - by) <= r:
-                return True
-        return False
-
-    def pick_new_goal(self, rx: float, ry: float) -> None:
-        grid = self.latest_map
+    # ================================================================ #
+    #  Frontier detection
+    # ================================================================ #
+    def find_frontiers(self) -> List[List[Tuple[int, int]]]:
+        """Return list of frontier clusters (each cluster = list of (row,col))."""
+        grid = self.map_grid
         if grid is None:
-            return
+            return []
+        H, W = grid.shape
 
-        frontiers = self.find_frontier_cells(grid)
-        if not frontiers:
-            return
+        free_mask = grid == 0
+        unknown_mask = grid == -1
 
-        clusters = self.cluster_frontiers(frontiers, grid.info.width, grid.info.height)
-        clusters = [c for c in clusters if len(c) >= self.min_cluster_size]
-        if not clusters:
-            return
-
-        best = None
-        best_score = -1e18
-
-        for cluster in clusters:
-            wx, wy = self.pick_cluster_point_farthest_from_robot(cluster, rx, ry, grid)
-
-            if math.hypot(wx - rx, wy - ry) < self.min_goal_sep:
-                continue
-            if self.is_blacklisted_world(wx, wy):
-                continue
-
-            dist = math.hypot(wx - rx, wy - ry)
-            size = float(len(cluster))
-            score = 2.0 * size + 0.6 * dist
-
-            if score > best_score:
-                best_score = score
-                best = (wx, wy)
-
-        if best is None:
-            self.blacklisted_goals.clear()
-            for cluster in clusters:
-                wx, wy = self.pick_cluster_point_farthest_from_robot(cluster, rx, ry, grid)
-                if math.hypot(wx - rx, wy - ry) < self.min_goal_sep:
+        # Check 8-connected neighbors for unknown cells
+        adjacent_to_unknown = np.zeros((H, W), dtype=bool)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
                     continue
-                dist = math.hypot(wx - rx, wy - ry)
-                size = float(len(cluster))
-                score = 2.0 * size + 0.6 * dist
-                if score > best_score:
-                    best_score = score
-                    best = (wx, wy)
-            if best is None:
-                return
+                # Shift unknown_mask by (-dr, -dc) so that
+                # adjacent_to_unknown[r,c] is True if (r+dr, c+dc) is unknown
+                r_start = max(0, dr)
+                r_end = H + min(0, dr)
+                c_start = max(0, dc)
+                c_end = W + min(0, dc)
 
-        self.current_goal_world = best
-        self.goal_start_wall_time = time.time()
-        self.pose_hist.clear()
-        self.pose_hist.append((time.time(), rx, ry))
-        self.recoveries_this_goal = 0
+                src_r_start = max(0, -dr)
+                src_r_end = H + min(0, -dr)  # = H - max(0, dr)
+                src_c_start = max(0, -dc)
+                src_c_end = W + min(0, -dc)  # = W - max(0, dc)
 
-    def pick_cluster_point_farthest_from_robot(
-        self,
-        cluster: List[Tuple[int, int]],
-        rx: float,
-        ry: float,
-        grid: OccupancyGrid
-    ) -> Tuple[float, float]:
-        best = None
-        best_d = -1.0
-        step = max(1, len(cluster) // 40)
-        for i in range(0, len(cluster), step):
-            cx, cy = cluster[i]
-            wx, wy = self.cell_to_world(cx, cy, grid)
-            d = math.hypot(wx - rx, wy - ry)
-            if d > best_d:
-                best_d = d
-                best = (wx, wy)
-        if best is None:
-            cx, cy = cluster[len(cluster) // 2]
-            best = self.cell_to_world(cx, cy, grid)
-        return best
+                adjacent_to_unknown[r_start:r_end, c_start:c_end] |= unknown_mask[
+                    src_r_start:src_r_end, src_c_start:src_c_end
+                ]
 
-    def find_frontier_cells(self, grid: OccupancyGrid) -> List[Tuple[int, int]]:
-        w = grid.info.width
-        h = grid.info.height
-        data = grid.data
+        frontier_mask = free_mask & adjacent_to_unknown
 
-        def idx(x: int, y: int) -> int:
-            return y * w + x
+        # Collect frontier coordinates
+        frontier_rows, frontier_cols = np.where(frontier_mask)
+        if frontier_rows.size == 0:
+            return []
 
-        def is_free(v: int) -> bool:
-            if v < 0:
-                return False
-            return v <= self.free_threshold
+        frontier_set = set(zip(frontier_rows.tolist(), frontier_cols.tolist()))
 
-        def is_unknown(v: int) -> bool:
-            return v < 0
-
-        frontiers: List[Tuple[int, int]] = []
-        for y in range(h):
-            for x in range(w):
-                v = data[idx(x, y)]
-                if not is_free(v):
-                    continue
-                if self.has_unknown_neighbor(x, y, w, h, data, idx, is_unknown):
-                    frontiers.append((x, y))
-        return frontiers
-
-    def has_unknown_neighbor(self, x: int, y: int, w: int, h: int, data: List[int], idx_fn, is_unknown_fn) -> bool:
-        for ny in (y - 1, y, y + 1):
-            for nx in (x - 1, x, x + 1):
-                if nx == x and ny == y:
-                    continue
-                if nx < 0 or nx >= w or ny < 0 or ny >= h:
-                    continue
-                if is_unknown_fn(data[idx_fn(nx, ny)]):
-                    return True
-        return False
-
-    def cluster_frontiers(self, frontier_cells: List[Tuple[int, int]], w: int, h: int) -> List[List[Tuple[int, int]]]:
-        frontier_set: Set[Tuple[int, int]] = set(frontier_cells)
-        visited: Set[Tuple[int, int]] = set()
+        # BFS clustering
+        min_size = int(self.get_parameter("min_frontier_cluster_size").value)
+        visited = set()
         clusters: List[List[Tuple[int, int]]] = []
 
-        for cell in frontier_cells:
+        for cell in frontier_set:
             if cell in visited:
                 continue
-            q = deque([cell])
-            visited.add(cell)
             cluster: List[Tuple[int, int]] = []
-
-            while q:
-                cx, cy = q.popleft()
-                cluster.append((cx, cy))
-                for ny in (cy - 1, cy, cy + 1):
-                    for nx in (cx - 1, cx, cx + 1):
-                        if nx == cx and ny == cy:
+            queue = deque([cell])
+            visited.add(cell)
+            while queue:
+                cr, cc = queue.popleft()
+                cluster.append((cr, cc))
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
                             continue
-                        if nx < 0 or nx >= w or ny < 0 or ny >= h:
-                            continue
-                        nb = (nx, ny)
-                        if nb in visited:
-                            continue
-                        if nb in frontier_set:
+                        nb = (cr + dr, cc + dc)
+                        if nb in frontier_set and nb not in visited:
                             visited.add(nb)
-                            q.append(nb)
-
-            clusters.append(cluster)
+                            queue.append(nb)
+            if len(cluster) >= min_size:
+                clusters.append(cluster)
 
         return clusters
 
-    def cell_to_world(self, cx: int, cy: int, grid: OccupancyGrid) -> Tuple[float, float]:
-        res = grid.info.resolution
-        ox = grid.info.origin.position.x
-        oy = grid.info.origin.position.y
-        return ox + (cx + 0.5) * res, oy + (cy + 0.5) * res
+    # ================================================================ #
+    #  Frontier goal selection
+    # ================================================================ #
+    def select_frontier_goal(
+        self, clusters: List[List[Tuple[int, int]]], robot_x: float, robot_y: float
+    ) -> Optional[Tuple[float, float]]:
+        """Score clusters and return best centroid in world coords, or None."""
+        w_size = float(self.get_parameter("score_size_weight").value)
+        w_dist = float(self.get_parameter("score_distance_weight").value)
+        bl_radius = float(self.get_parameter("goal_blacklist_radius_m").value)
 
-    def potential_field_cmd(self, rx: float, ry: float, yaw: float, gx: float, gy: float, scan: LaserScan) -> Twist:
-        dx_w = gx - rx
-        dy_w = gy - ry
+        best_score = -float("inf")
+        best_goal: Optional[Tuple[float, float]] = None
 
+        for cluster in clusters:
+            # Centroid in grid coords
+            rows = [c[0] for c in cluster]
+            cols = [c[1] for c in cluster]
+            cr = int(np.mean(rows))
+            cc = int(np.mean(cols))
+            gx, gy = occ_grid_to_world(
+                cr, cc, self.map_origin_x, self.map_origin_y, self.map_resolution
+            )
+
+            # Skip blacklisted
+            blacklisted = False
+            for bx, by in self.blacklisted_goals:
+                if math.hypot(gx - bx, gy - by) < bl_radius:
+                    blacklisted = True
+                    break
+            if blacklisted:
+                continue
+
+            dist = math.hypot(gx - robot_x, gy - robot_y)
+            score = w_size * len(cluster) - w_dist * dist
+            if score > best_score:
+                best_score = score
+                best_goal = (gx, gy)
+
+        return best_goal
+
+    # ================================================================ #
+    #  Planning
+    # ================================================================ #
+    def build_planning_grid(self) -> Optional[np.ndarray]:
+        """Build inflated binary grid from SLAM map. 0=free, 100=obstacle."""
+        if self.map_grid is None:
+            return None
+
+        grid = np.copy(self.map_grid)
+        # Unknown → obstacle for safe planning
+        grid[grid == -1] = 100
+        # Any positive value → obstacle
+        grid[grid > 0] = 100
+        # Free stays 0
+
+        inflation_m = float(self.get_parameter("inflation_radius_m").value)
+        inflation_cells = int(math.ceil(inflation_m / self.map_resolution))
+
+        if inflation_cells <= 0:
+            return grid.astype(np.uint8)
+
+        obstacle = (grid == 100).astype(np.uint8)
+        try:
+            from scipy.ndimage import binary_dilation
+
+            size = 2 * inflation_cells + 1
+            structure = np.ones((size, size), dtype=bool)
+            inflated = binary_dilation(obstacle.astype(bool), structure=structure)
+            out = np.zeros_like(grid, dtype=np.uint8)
+            out[inflated] = 100
+        except ImportError:
+            inflated = np.copy(obstacle)
+            H, W = grid.shape
+            ys, xs = np.where(obstacle == 1)
+            for y_i, x_i in zip(ys, xs):
+                r0 = max(0, y_i - inflation_cells)
+                r1 = min(H, y_i + inflation_cells + 1)
+                c0 = max(0, x_i - inflation_cells)
+                c1 = min(W, x_i + inflation_cells + 1)
+                inflated[r0:r1, c0:c1] = 1
+            out = np.zeros_like(grid, dtype=np.uint8)
+            out[inflated == 1] = 100
+
+        return out
+
+    def plan_to_goal(self, goal_x: float, goal_y: float) -> bool:
+        """Plan A* path to goal. Returns True on success."""
+        pose = self.get_robot_pose()
+        if pose is None:
+            return False
+
+        planning_grid = self.build_planning_grid()
+        if planning_grid is None:
+            return False
+
+        rx, ry, _ = pose
+        start = occ_world_to_grid(
+            rx, ry, self.map_origin_x, self.map_origin_y, self.map_resolution
+        )
+        goal = occ_world_to_grid(
+            goal_x, goal_y, self.map_origin_x, self.map_origin_y, self.map_resolution
+        )
+
+        H, W = planning_grid.shape
+
+        # Clamp to grid bounds
+        start = (clamp(start[0], 0, H - 1), clamp(start[1], 0, W - 1))
+        goal = (clamp(goal[0], 0, H - 1), clamp(goal[1], 0, W - 1))
+
+        # Make sure start is int
+        start = (int(start[0]), int(start[1]))
+        goal = (int(goal[0]), int(goal[1]))
+
+        # If start or goal is in obstacle, try to find nearest free cell
+        start = self._nearest_free(planning_grid, start)
+        goal = self._nearest_free(planning_grid, goal)
+        if start is None or goal is None:
+            return False
+
+        path = astar(planning_grid, start, goal, allow_diagonal=True)
+        if path is None:
+            self.get_logger().warn("A* failed: no path to frontier goal.")
+            return False
+
+        every_n = int(self.get_parameter("waypoint_every_n_cells").value)
+        wp_cells = extract_waypoints(path, take_every_n=every_n)
+
+        self.waypoints_world = [
+            occ_grid_to_world(
+                r, c, self.map_origin_x, self.map_origin_y, self.map_resolution
+            )
+            for (r, c) in wp_cells
+        ]
+        self.wp_index = 0
+
+        self.get_logger().info(
+            f"Planned path: {len(path)} cells, {len(self.waypoints_world)} waypoints "
+            f"to ({goal_x:.2f}, {goal_y:.2f})"
+        )
+        return True
+
+    def _nearest_free(
+        self, grid: np.ndarray, cell: Tuple[int, int], max_radius: int = 20
+    ) -> Optional[Tuple[int, int]]:
+        """Find nearest free cell to 'cell' within max_radius. BFS spiral."""
+        H, W = grid.shape
+        r, c = cell
+        if 0 <= r < H and 0 <= c < W and grid[r, c] == 0:
+            return cell
+
+        visited = set()
+        queue = deque([cell])
+        visited.add(cell)
+        while queue:
+            cr, cc = queue.popleft()
+            if abs(cr - r) > max_radius or abs(cc - c) > max_radius:
+                continue
+            if 0 <= cr < H and 0 <= cc < W and grid[cr, cc] == 0:
+                return (cr, cc)
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    nb = (cr + dr, cc + dc)
+                    if nb not in visited and 0 <= nb[0] < H and 0 <= nb[1] < W:
+                        visited.add(nb)
+                        queue.append(nb)
+        return None
+
+    # ================================================================ #
+    #  Stuck detection
+    # ================================================================ #
+    def check_stuck(self, x: float, y: float) -> bool:
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self.pose_history.append((x, y, now))
+
+        window = float(self.get_parameter("stuck_window_s").value)
+        threshold = float(self.get_parameter("stuck_threshold_m").value)
+
+        # Trim old entries
+        self.pose_history = [(px, py, t) for (px, py, t) in self.pose_history if now - t <= window]
+
+        if len(self.pose_history) < 2:
+            return False
+        # Need sufficient data (at least half the window)
+        if now - self.pose_history[0][2] < window * 0.5:
+            return False
+
+        total_dist = 0.0
+        for i in range(1, len(self.pose_history)):
+            dx = self.pose_history[i][0] - self.pose_history[i - 1][0]
+            dy = self.pose_history[i][1] - self.pose_history[i - 1][1]
+            total_dist += math.hypot(dx, dy)
+
+        return total_dist < threshold
+
+    # ================================================================ #
+    #  State transitions
+    # ================================================================ #
+    def set_state(self, new_state: int):
+        if new_state != self.state:
+            self.get_logger().info(
+                f"State: {_STATE_NAMES.get(self.state, '?')} -> "
+                f"{_STATE_NAMES.get(new_state, '?')}"
+            )
+            self.state = new_state
+
+    # ================================================================ #
+    #  Main control loop (20 Hz)
+    # ================================================================ #
+    def control_loop(self):
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+
+        # ---- WARMUP ----
+        if self.state == WARMUP:
+            if self.warmup_start is None:
+                self.warmup_start = now_s
+            elapsed = now_s - self.warmup_start
+            warmup_dur = float(self.get_parameter("warmup_duration_s").value)
+
+            if elapsed < warmup_dur:
+                cmd = Twist()
+                cmd.angular.z = float(self.get_parameter("warmup_angular_speed").value)
+                self.cmd_pub.publish(cmd)
+                return
+            else:
+                self.cmd_pub.publish(Twist())
+                if self.map_grid is not None:
+                    self.set_state(FIND_FRONTIER)
+                return
+
+        # ---- DONE ----
+        if self.state == DONE:
+            self.cmd_pub.publish(Twist())
+            return
+
+        # ---- RECOVERY ----
+        if self.state == RECOVERY:
+            self._do_recovery(now_s)
+            return
+
+        # ---- FIND_FRONTIER ----
+        if self.state == FIND_FRONTIER:
+            self._do_find_frontier(now_s)
+            return
+
+        # ---- NAVIGATE ----
+        if self.state == NAVIGATE:
+            self._do_navigate(now_s)
+            return
+
+    # ================================================================ #
+    #  FIND_FRONTIER logic
+    # ================================================================ #
+    def _do_find_frontier(self, now_s: float):
+        if self.map_grid is None:
+            return
+
+        pose = self.get_robot_pose()
+        if pose is None:
+            return
+
+        rx, ry, _ = pose
+        clusters = self.find_frontiers()
+
+        if not clusters:
+            # Try clearing blacklist and re-checking
+            if self.blacklisted_goals:
+                self.get_logger().info(
+                    "No frontiers with blacklist; clearing blacklist and retrying."
+                )
+                self.blacklisted_goals.clear()
+                clusters = self.find_frontiers()
+
+        if not clusters:
+            self.get_logger().info("No frontier clusters found. Exploration complete!")
+            self.set_state(DONE)
+            return
+
+        goal = self.select_frontier_goal(clusters, rx, ry)
+        if goal is None:
+            self.get_logger().info("All frontier goals blacklisted; clearing blacklist.")
+            self.blacklisted_goals.clear()
+            goal = self.select_frontier_goal(clusters, rx, ry)
+
+        if goal is None:
+            self.get_logger().info("No reachable frontier goal. Exploration complete!")
+            self.set_state(DONE)
+            return
+
+        self.current_goal = goal
+        self.get_logger().info(f"Frontier goal: ({goal[0]:.2f}, {goal[1]:.2f})")
+
+        if self.plan_to_goal(goal[0], goal[1]):
+            self.last_goal_select_time = now_s
+            self.pose_history.clear()
+            self.set_state(NAVIGATE)
+        else:
+            # Blacklist unreachable goal and try again next tick
+            self.blacklisted_goals.append(goal)
+            self.get_logger().warn("Path planning failed; blacklisting goal.")
+
+    # ================================================================ #
+    #  NAVIGATE logic
+    # ================================================================ #
+    def _do_navigate(self, now_s: float):
+        if self.scan is None:
+            return
+
+        pose = self.get_robot_pose()
+        if pose is None:
+            return
+
+        x, y, yaw = pose
+
+        # Periodic frontier reselection
+        reselect_s = float(self.get_parameter("reselect_goal_every_s").value)
+        if now_s - self.last_goal_select_time > reselect_s:
+            self.get_logger().info("Periodic frontier reselection.")
+            self.set_state(FIND_FRONTIER)
+            return
+
+        # Check if goal reached
+        goal_dist = float(self.get_parameter("goal_reached_dist_m").value)
+        if self.current_goal is not None:
+            dist_to_goal = math.hypot(
+                self.current_goal[0] - x, self.current_goal[1] - y
+            )
+            if dist_to_goal < goal_dist:
+                self.get_logger().info(
+                    f"Frontier goal reached at ({x:.2f}, {y:.2f})."
+                )
+                self.set_state(FIND_FRONTIER)
+                return
+
+        # Check if all waypoints exhausted
+        if not self.waypoints_world or self.wp_index >= len(self.waypoints_world):
+            self.get_logger().info("Waypoints exhausted; reselecting frontier.")
+            self.set_state(FIND_FRONTIER)
+            return
+
+        # Stuck detection
+        if self.check_stuck(x, y):
+            self.get_logger().warn("Robot appears stuck; entering recovery.")
+            self.recovery_start = now_s
+            self.recovery_phase = 0
+            if self.current_goal is not None:
+                self.blacklisted_goals.append(self.current_goal)
+            self.set_state(RECOVERY)
+            return
+
+        # Waypoint advancement (skip passed waypoints)
+        wp_reached = float(self.get_parameter("goal_reached_dist_m").value)
+        while self.wp_index < len(self.waypoints_world) - 1:
+            wx0, wy0 = self.waypoints_world[self.wp_index]
+            wx1, wy1 = self.waypoints_world[self.wp_index + 1]
+
+            segx = wx1 - wx0
+            segy = wy1 - wy0
+            seg_len = math.hypot(segx, segy)
+            if seg_len < 1e-6:
+                self.wp_index += 1
+                continue
+
+            dirx = segx / seg_len
+            diry = segy / seg_len
+            relx = x - wx0
+            rely = y - wy0
+            progress = relx * dirx + rely * diry
+            dist_to_current = math.hypot(wx0 - x, wy0 - y)
+
+            if progress > wp_reached and dist_to_current > wp_reached:
+                self.wp_index += 1
+                continue
+            break
+
+        # Current waypoint check
+        wx, wy = self.waypoints_world[self.wp_index]
+        dist_wp = math.hypot(wx - x, wy - y)
+        if dist_wp <= wp_reached:
+            if self.wp_index >= len(self.waypoints_world) - 1:
+                self.set_state(FIND_FRONTIER)
+                return
+            self.wp_index += 1
+            wx, wy = self.waypoints_world[self.wp_index]
+
+        # ---- Potential field controller ----
+        self._drive_potential_field(x, y, yaw, wx, wy)
+
+    # ================================================================ #
+    #  Potential field navigation
+    # ================================================================ #
+    def _drive_potential_field(
+        self, x: float, y: float, yaw: float, wx: float, wy: float
+    ):
+        k_att = float(self.get_parameter("k_att").value)
+        k_rep = float(self.get_parameter("k_rep").value)
+        rep_range = float(self.get_parameter("repulsion_range_m").value)
+        stop_range = float(self.get_parameter("stop_range_m").value)
+
+        # Attractive force in robot frame
+        dx_w = wx - x
+        dy_w = wy - y
         c = math.cos(-yaw)
         s = math.sin(-yaw)
         dx_r = c * dx_w - s * dy_w
         dy_r = s * dx_w + c * dy_w
 
-        F_att = np.array([self.k_att * dx_r, self.k_att * dy_r], dtype=np.float32)
+        F_att = np.array([k_att * dx_r, k_att * dy_r], dtype=np.float64)
 
-        ranges = np.array(scan.ranges, dtype=np.float32)
-        angles = scan.angle_min + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
+        # Repulsive forces from LaserScan
+        scan = self.scan
+        ranges = np.array(scan.ranges, dtype=np.float64)
+        angles = scan.angle_min + np.arange(len(ranges), dtype=np.float64) * scan.angle_increment
 
-        valid = np.isfinite(ranges)
+        valid = np.isfinite(ranges) & (ranges > 0.0)
         ranges = ranges[valid]
         angles = angles[valid]
 
+        # Front-blocked rotation: suppress linear but keep rotating
         front_cone = np.abs(angles) < math.radians(35.0)
-        front_blocked = bool(np.any(ranges[front_cone] < self.stop_range))
+        front_blocked = bool(np.any(ranges[front_cone] < stop_range))
 
-        F_rep = np.zeros(2, dtype=np.float32)
-        in_range = ranges < self.rep_range
+        F_rep = np.zeros(2, dtype=np.float64)
+        in_range = ranges < rep_range
         rr = ranges[in_range]
         aa = angles[in_range]
 
@@ -548,163 +712,116 @@ class FrontierPotentialFieldExplorer(Node):
             oy = rr * np.sin(aa)
 
             inv_r = 1.0 / np.maximum(rr, 1e-3)
-            mag = self.k_rep * (inv_r - 1.0 / self.rep_range) * (inv_r ** 2)
+            mag = k_rep * (inv_r - 1.0 / rep_range) * (inv_r ** 2)
 
-            dirx = -ox / np.maximum(rr, 1e-3)
-            diry = -oy / np.maximum(rr, 1e-3)
+            dir_x = -ox / np.maximum(rr, 1e-3)
+            dir_y = -oy / np.maximum(rr, 1e-3)
 
-            fx = mag * dirx
-            fy = mag * diry
+            fx = mag * dir_x
+            fy = mag * dir_y
 
-            F_rep[0] = float(np.clip(np.sum(fx), -6.0, 6.0))
-            F_rep[1] = float(np.clip(np.sum(fy), -6.0, 6.0))
+            F_rep[0] = float(np.clip(np.sum(fx), -5.0, 5.0))
+            F_rep[1] = float(np.clip(np.sum(fy), -5.0, 5.0))
 
-        # Tangential force: when repulsion opposes attraction (corner/dead-end),
-        # add a perpendicular component so the robot slides along the wall.
-        F_rep_mag = float(np.linalg.norm(F_rep))
-        F_att_mag = float(np.linalg.norm(F_att))
-        if F_rep_mag > 0.3 and F_att_mag > 0.01:
-            cos_angle = float(np.dot(F_att, F_rep)) / (F_att_mag * F_rep_mag)
-            if cos_angle < -0.2:  # forces opposing (angle > ~102°)
-                tangent = np.array([-F_rep[1], F_rep[0]], dtype=np.float32)
-                if np.dot(tangent, F_att) < 0:
-                    tangent = -tangent
-                t_norm = float(np.linalg.norm(tangent))
-                if t_norm > 1e-6:
-                    tangent = tangent / t_norm
-                    blend = min(1.0, (-cos_angle - 0.2) / 0.6)
-                    F_rep = F_rep + blend * 0.5 * F_rep_mag * tangent
+        # Tangential wall-sliding: when forces oppose, add perpendicular component
+        att_norm = np.linalg.norm(F_att)
+        rep_norm = np.linalg.norm(F_rep)
+        if att_norm > 1e-4 and rep_norm > 1e-4:
+            dot = float(np.dot(F_att / att_norm, F_rep / rep_norm))
+            if dot < -0.3:
+                tangent = np.array([-F_rep[1], F_rep[0]], dtype=np.float64)
+                F_rep = F_rep + 0.5 * tangent
 
         F = F_att + F_rep
 
-        desired_heading = math.atan2(F[1], F[0])
+        desired_heading = math.atan2(float(F[1]), float(F[0]))
+        heading_err = wrap_angle(desired_heading)
 
-        if not self.have_filtered:
-            self.filtered_heading = desired_heading
-            self.filtered_ang = 0.0
-            self.have_filtered = True
-        else:
-            err = wrap_angle(desired_heading - self.filtered_heading)
-            self.filtered_heading = wrap_angle(self.filtered_heading + self.heading_alpha * err)
+        max_ang = float(self.get_parameter("max_ang").value)
+        max_lin = float(self.get_parameter("max_lin").value)
+        k_heading = float(self.get_parameter("k_heading").value)
 
-        heading_err = wrap_angle(self.filtered_heading)
+        ang = clamp(k_heading * heading_err, -max_ang, max_ang)
 
-        raw_ang = clamp(self.k_heading * heading_err, -self.max_ang, self.max_ang)
-        self.filtered_ang = (1.0 - self.ang_alpha) * self.filtered_ang + self.ang_alpha * raw_ang
-        ang = float(self.filtered_ang)
+        heading_factor = max(0.0, math.cos(heading_err))
+        lin = clamp(0.6 * heading_factor * max_lin, 0.0, max_lin)
 
-        heading_factor = max(0.0, math.cos(self.lin_scale * heading_err))
-        lin = clamp(0.7 * heading_factor * self.max_lin, 0.0, self.max_lin)
-
-        # Wenn er stark drehen muss, gib eine minimale Vorwärtsfahrt, sonst zittert er auf der Stelle
-        if abs(heading_err) > math.radians(50.0):
-            lin = max(lin, self.min_lin_when_turning)
-
-        # Gradually slow down when obstacles are close in the front hemisphere
-        front_hemi = np.abs(angles) < math.radians(90.0)
-        front_ranges = ranges[front_hemi]
-        if front_ranges.size > 0:
-            min_front = float(np.min(front_ranges))
-            if min_front < self.rep_range:
-                prox = max(0.0, (min_front - self.stop_range) / (self.rep_range - self.stop_range))
-                lin *= prox
-
-        # Front blocked: stop forward motion but keep turning to escape
+        # Front-blocked: allow rotation but suppress forward motion
         if front_blocked:
             lin = 0.0
 
         cmd = Twist()
         cmd.linear.x = float(lin)
         cmd.angular.z = float(ang)
-        return cmd
+        self.cmd_pub.publish(cmd)
 
-    def update_pose_hist(self, rx: float, ry: float) -> None:
-        self.pose_hist.append((time.time(), rx, ry))
+    # ================================================================ #
+    #  Recovery behavior
+    # ================================================================ #
+    def _do_recovery(self, now_s: float):
+        if self.recovery_start is None:
+            self.recovery_start = now_s
 
-    def is_stuck(self) -> bool:
-        if len(self.pose_hist) < 6:
-            return False
-        now = time.time()
-        pts = [p for p in self.pose_hist if (now - p[0]) <= self.stuck_window_s]
-        if len(pts) < 6:
-            return False
-        path = 0.0
-        for i in range(1, len(pts)):
-            path += math.hypot(pts[i][1] - pts[i - 1][1], pts[i][2] - pts[i - 1][2])
-        return path < self.stuck_min_path_m
+        elapsed = now_s - self.recovery_start
+        back_dur = float(self.get_parameter("recovery_back_duration_s").value)
+        turn_dur = float(self.get_parameter("recovery_turn_duration_s").value)
 
-    def no_progress_toward_goal(self) -> bool:
-        now = time.time()
-        pts = [p for p in self.goal_dist_hist if (now - p[0]) <= self.progress_window_s]
-        if len(pts) < 6:
-            return False
-        d0 = pts[0][1]
-        d1 = pts[-1][1]
-        return (d0 - d1) < self.progress_min_delta_m
+        cmd = Twist()
 
-    def is_oscillating(self) -> bool:
-        now = time.time()
-        pts = [(t, v) for t, v in self.ang_cmd_hist if (now - t) <= 2.5]
-        if len(pts) < 15:
-            return False
-        sign_changes = 0
-        for i in range(1, len(pts)):
-            if (pts[i][1] * pts[i - 1][1] < 0
-                    and abs(pts[i][1]) > 0.05
-                    and abs(pts[i - 1][1]) > 0.05):
-                sign_changes += 1
-        return sign_changes >= 5
+        if self.recovery_phase == 0:
+            # Phase 0: back up
+            if elapsed < back_dur:
+                cmd.linear.x = float(self.get_parameter("recovery_back_speed").value)
+                self.cmd_pub.publish(cmd)
+                return
+            else:
+                self.recovery_phase = 1
+                self.recovery_start = now_s
+                elapsed = 0.0
 
-    def start_recovery(self) -> None:
-        self.recoveries_this_goal += 1
-        self.recovery_start_wall_time = time.time()
-        self.mode = "RECOVERY_BACKUP"
-        self.recovery_turn_sign = self.choose_turn_direction_from_scan()
-        self.ang_cmd_hist.clear()
-        self.have_filtered = False
-        self.get_logger().warn(f"Recovery started, attempt {self.recoveries_this_goal}, turn_sign {self.recovery_turn_sign}")
+        if self.recovery_phase == 1:
+            # Phase 1: turn toward more open side
+            if elapsed < turn_dur:
+                turn_dir = self._open_side_direction()
+                cmd.angular.z = turn_dir * float(
+                    self.get_parameter("recovery_turn_speed").value
+                )
+                self.cmd_pub.publish(cmd)
+                return
+            else:
+                # Recovery complete
+                self.cmd_pub.publish(Twist())
+                self.pose_history.clear()
+                self.set_state(FIND_FRONTIER)
 
-    def choose_turn_direction_from_scan(self) -> float:
-        scan = self.scan
-        if scan is None:
+    def _open_side_direction(self) -> float:
+        """Return +1.0 to turn left, -1.0 to turn right, based on LiDAR."""
+        if self.scan is None:
             return 1.0
-        ranges = np.array(scan.ranges, dtype=np.float32)
-        angles = scan.angle_min + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
-        valid = np.isfinite(ranges)
+
+        ranges = np.array(self.scan.ranges, dtype=np.float64)
+        angles = self.scan.angle_min + np.arange(len(ranges), dtype=np.float64) * self.scan.angle_increment
+
+        valid = np.isfinite(ranges) & (ranges > 0.0)
         ranges = ranges[valid]
         angles = angles[valid]
-        left = ranges[(angles > 0.6) & (angles < 1.2)]
-        right = ranges[(angles < -0.6) & (angles > -1.2)]
-        left_score = float(np.nanmean(left)) if left.size > 0 else 0.0
-        right_score = float(np.nanmean(right)) if right.size > 0 else 0.0
-        return 1.0 if left_score >= right_score else -1.0
 
-    def run_recovery(self) -> None:
-        elapsed = time.time() - self.recovery_start_wall_time
+        if ranges.size == 0:
+            return 1.0
 
-        if self.mode == "RECOVERY_BACKUP":
-            cmd = Twist()
-            cmd.linear.x = float(self.recovery_backup_speed)
-            cmd.angular.z = 0.0
-            self.cmd_pub.publish(cmd)
-            if elapsed >= self.recovery_backup_s:
-                self.mode = "RECOVERY_TURN"
-                self.recovery_start_wall_time = time.time()
-            return
+        # Replace inf/nan (already filtered) — cap at max range for summing
+        max_r = float(np.max(ranges))
+        capped = np.minimum(ranges, max_r)
 
-        if self.mode == "RECOVERY_TURN":
-            cmd = Twist()
-            cmd.linear.x = 0.0
-            cmd.angular.z = float(self.recovery_turn_sign * self.recovery_turn_speed)
-            self.cmd_pub.publish(cmd)
-            if elapsed >= self.recovery_turn_s:
-                self.mode = "NORMAL"
-                self.current_goal_world = None
-                self.last_reselect_wall_time = time.time()
-            return
+        left_mask = angles > 0.0
+        right_mask = angles < 0.0
+        left_sum = float(np.sum(capped[left_mask])) if np.any(left_mask) else 0.0
+        right_sum = float(np.sum(capped[right_mask])) if np.any(right_mask) else 0.0
+
+        return 1.0 if left_sum >= right_sum else -1.0
 
 
-def main() -> None:
+def main():
     rclpy.init()
     node = FrontierPotentialFieldExplorer()
     try:

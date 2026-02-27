@@ -21,7 +21,6 @@ setup(
         "console_scripts": [
             "planner_pf_node = my_planner_pkg.planner_pf_node:main",
             "pf_localization = my_planner_pkg.particle_filter_localization:main",
-            "frontier_explorer = my_planner_pkg.frontier_explorer_node:main",
             "frontier_pf_explorer = my_planner_pkg.frontier_pf_explorer_node:main",
         ],
     },
