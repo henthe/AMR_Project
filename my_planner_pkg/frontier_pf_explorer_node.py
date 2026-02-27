@@ -101,10 +101,10 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.declare_parameter("goal_reached_dist_m", 0.35)
         self.declare_parameter("min_frontier_cluster_size", 5)
-        self.declare_parameter("score_size_weight", 2.0)
-        self.declare_parameter("score_distance_weight", 0.6)
+        self.declare_parameter("score_size_weight", 0.3)
+        self.declare_parameter("score_distance_weight", 2.0)
 
-        self.declare_parameter("reselect_goal_every_s", 10.0)
+        self.declare_parameter("reselect_goal_every_s", 5.0)
         self.declare_parameter("warmup_duration_s", 5.0)
         self.declare_parameter("warmup_angular_speed", 0.8)
 
@@ -145,6 +145,9 @@ class FrontierPotentialFieldExplorer(Node):
         # Stuck detection
         self.pose_history: List[Tuple[float, float, float]] = []  # (x, y, stamp)
         self.navigate_start_time: float = 0.0
+
+        # Front-blocked tracking (corner detection)
+        self.front_blocked_since: Optional[float] = None
 
         # Recovery
         self.recovery_start: Optional[float] = None
@@ -719,10 +722,26 @@ class FrontierPotentialFieldExplorer(Node):
             self.get_logger().warn("Robot appears stuck; entering recovery.")
             self.recovery_start = now_s
             self.recovery_phase = 0
+            self.front_blocked_since = None
             if self.current_goal is not None:
                 self.blacklisted_goals.append(self.current_goal)
             self.set_state(RECOVERY)
             return
+
+        # Corner detection: front blocked for too long → recovery
+        if self.front_blocked_since is not None:
+            blocked_dur = now_s - self.front_blocked_since
+            if blocked_dur > 2.0:
+                self.get_logger().warn(
+                    f"Front blocked for {blocked_dur:.1f}s (corner); entering recovery."
+                )
+                self.recovery_start = now_s
+                self.recovery_phase = 0
+                self.front_blocked_since = None
+                if self.current_goal is not None:
+                    self.blacklisted_goals.append(self.current_goal)
+                self.set_state(RECOVERY)
+                return
 
         # Waypoint advancement (skip passed waypoints)
         wp_reached = float(self.get_parameter("goal_reached_dist_m").value)
@@ -818,12 +837,20 @@ class FrontierPotentialFieldExplorer(Node):
             F_rep[1] = float(np.clip(np.sum(fy), -5.0, 5.0))
 
         # Tangential wall-sliding: when forces oppose, add perpendicular component
+        # Choose the tangent direction that aligns with the attractive force
+        # to avoid oscillation in corners
         att_norm = np.linalg.norm(F_att)
         rep_norm = np.linalg.norm(F_rep)
         if att_norm > 1e-4 and rep_norm > 1e-4:
             dot = float(np.dot(F_att / att_norm, F_rep / rep_norm))
             if dot < -0.3:
-                tangent = np.array([-F_rep[1], F_rep[0]], dtype=np.float64)
+                tangent_a = np.array([-F_rep[1], F_rep[0]], dtype=np.float64)
+                tangent_b = np.array([F_rep[1], -F_rep[0]], dtype=np.float64)
+                # Pick the tangent that points more toward the goal
+                if np.dot(tangent_a, F_att) >= np.dot(tangent_b, F_att):
+                    tangent = tangent_a
+                else:
+                    tangent = tangent_b
                 F_rep = F_rep + 1.0 * tangent
 
         F = F_att + F_rep
@@ -849,6 +876,10 @@ class FrontierPotentialFieldExplorer(Node):
         # Front-blocked: stop forward motion, rotation continues
         if front_blocked:
             lin = 0.0
+            if self.front_blocked_since is None:
+                self.front_blocked_since = self.get_clock().now().nanoseconds * 1e-9
+        else:
+            self.front_blocked_since = None
 
         cmd = Twist()
         cmd.linear.x = float(lin)
