@@ -26,9 +26,10 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
+from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
 from tf2_ros import TransformException
@@ -167,8 +168,9 @@ class FrontierPotentialFieldExplorer(Node):
             LaserScan, "/scan", self.on_scan, qos_profile_sensor_data
         )
 
-        # ----- Publisher -----
+        # ----- Publishers -----
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.marker_pub = self.create_publisher(MarkerArray, "/explorer_markers", 10)
 
         # ----- Timer: 20 Hz control loop -----
         self.timer = self.create_timer(0.05, self.control_loop)
@@ -426,7 +428,71 @@ class FrontierPotentialFieldExplorer(Node):
             f"Planned path: {len(path)} cells, {len(self.waypoints_world)} waypoints "
             f"to ({goal_x:.2f}, {goal_y:.2f})"
         )
+        self.publish_markers(path)
         return True
+
+    def publish_markers(self, path_cells: list):
+        """Publish A* path + waypoints + goal marker for RViz."""
+        ma = MarkerArray()
+        frame = self.get_parameter("map_frame").value
+        stamp = self.get_clock().now().to_msg()
+
+        # --- A* path (green line) ---
+        path_m = Marker()
+        path_m.header.frame_id = frame
+        path_m.header.stamp = stamp
+        path_m.ns = "explorer_path"
+        path_m.id = 0
+        path_m.type = Marker.LINE_STRIP
+        path_m.action = Marker.ADD
+        path_m.scale.x = 0.03
+        path_m.color.g = 1.0
+        path_m.color.a = 1.0
+        for (r, c) in path_cells:
+            x, y = occ_grid_to_world(
+                r, c, self.map_origin_x, self.map_origin_y, self.map_resolution
+            )
+            path_m.points.append(Point(x=x, y=y, z=0.0))
+        ma.markers.append(path_m)
+
+        # --- Waypoints (red spheres) ---
+        wps_m = Marker()
+        wps_m.header.frame_id = frame
+        wps_m.header.stamp = stamp
+        wps_m.ns = "explorer_waypoints"
+        wps_m.id = 1
+        wps_m.type = Marker.SPHERE_LIST
+        wps_m.action = Marker.ADD
+        wps_m.scale.x = 0.10
+        wps_m.scale.y = 0.10
+        wps_m.scale.z = 0.10
+        wps_m.color.r = 1.0
+        wps_m.color.g = 0.2
+        wps_m.color.b = 0.2
+        wps_m.color.a = 1.0
+        for (x, y) in self.waypoints_world:
+            wps_m.points.append(Point(x=x, y=y, z=0.0))
+        ma.markers.append(wps_m)
+
+        # --- Goal (blue sphere) ---
+        if self.current_goal is not None:
+            goal_m = Marker()
+            goal_m.header.frame_id = frame
+            goal_m.header.stamp = stamp
+            goal_m.ns = "explorer_goal"
+            goal_m.id = 2
+            goal_m.type = Marker.SPHERE
+            goal_m.action = Marker.ADD
+            goal_m.scale.x = 0.20
+            goal_m.scale.y = 0.20
+            goal_m.scale.z = 0.20
+            goal_m.color.b = 1.0
+            goal_m.color.a = 1.0
+            goal_m.pose.position.x = self.current_goal[0]
+            goal_m.pose.position.y = self.current_goal[1]
+            ma.markers.append(goal_m)
+
+        self.marker_pub.publish(ma)
 
     def _nearest_free(
         self, grid: np.ndarray, cell: Tuple[int, int], max_radius: int = 20
@@ -484,7 +550,15 @@ class FrontierPotentialFieldExplorer(Node):
             dy = self.pose_history[i][1] - self.pose_history[i - 1][1]
             total_dist += math.hypot(dx, dy)
 
-        return total_dist < threshold
+        # Net displacement: straight-line from start to end of window.
+        # Catches oscillation/wobbling where total_dist accumulates
+        # but the robot makes no actual progress.
+        net_dist = math.hypot(
+            self.pose_history[-1][0] - self.pose_history[0][0],
+            self.pose_history[-1][1] - self.pose_history[0][1],
+        )
+
+        return total_dist < threshold or net_dist < threshold
 
     # ================================================================ #
     #  State transitions
