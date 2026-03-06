@@ -687,10 +687,9 @@ class FrontierPotentialFieldExplorer(Node):
                 self.state = State.FIND_FRONTIER
                 return
 
-        # --- Stuck detection (needs current waypoint distance) ---
-        cur_wp = self.waypoints_world[self.wp_index] if self.wp_index < len(self.waypoints_world) else self.goal_world
-        wp_dist_now = math.hypot(cur_wp[0] - x, cur_wp[1] - y) if cur_wp else 0.0
-        if self._is_stuck(x, y, wp_dist_now):
+        # --- Stuck detection (uses goal distance — stable across waypoint advances) ---
+        goal_dist_now = math.hypot(self.goal_world[0] - x, self.goal_world[1] - y) if self.goal_world else 0.0
+        if self._is_stuck(x, y, goal_dist_now):
             self.get_logger().warn(
                 f"Stuck at ({x:.2f}, {y:.2f}), starting random walk"
             )
