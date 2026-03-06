@@ -70,10 +70,10 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("k_att", 0.8)
         self.declare_parameter("k_rep", 5.0)
         self.declare_parameter("repulsion_range_m", 0.4)
-        self.declare_parameter("stop_range_m", 0.25)
+        self.declare_parameter("stop_range_m", 0.40)
         self.declare_parameter("k_heading", 2.0)
-        self.declare_parameter("max_lin", 1.0)
-        self.declare_parameter("max_ang", 2.0)
+        self.declare_parameter("max_lin", 1.5)
+        self.declare_parameter("max_ang", 3.0)
         self.declare_parameter("wp_reached_dist_m", 0.20)
         self.declare_parameter("goal_reached_dist_m", 0.50)
 
