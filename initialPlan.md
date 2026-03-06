@@ -1,5 +1,5 @@
 -we need to solve assignment 3
--we already did a previous version of our solution which you should not look at so dont look at old commits!
+-we already did a previous version of our solution (frontier_pf_explorer_node.py) which you should not look at so dont look at old commits!
 -the worklfow we have in mind includes the following:
 
 -the robot starts with an unexplored map (gridcells) in which it is centered
