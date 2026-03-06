@@ -75,9 +75,10 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("max_lin", 0.7)
         self.declare_parameter("max_ang", 1.5)
         self.declare_parameter("wp_reached_dist_m", 0.20)
-        self.declare_parameter("goal_reached_dist_m", 0.30)
+        self.declare_parameter("goal_reached_dist_m", 0.50)
 
         self.declare_parameter("min_frontier_cluster", 5)
+        self.declare_parameter("min_goal_wall_clearance_m", 0.5)
         self.declare_parameter("visited_goal_radius_m", 0.4)
         self.declare_parameter("stuck_window_s", 10.0)
         self.declare_parameter("stuck_threshold_m", 0.05)
@@ -228,6 +229,18 @@ class FrontierPotentialFieldExplorer(Node):
         return out
 
     # ==========================================================
+    # Wall clearance check (uses raw occ_grid, not planning_grid)
+    # ==========================================================
+    def _cell_clear_of_walls(self, r: int, c: int, clearance_cells: int) -> bool:
+        """Return True if no occupied cell (>0) is within clearance_cells of (r, c)."""
+        r0 = max(0, r - clearance_cells)
+        r1 = min(self.map_H, r + clearance_cells + 1)
+        c0 = max(0, c - clearance_cells)
+        c1 = min(self.map_W, c + clearance_cells + 1)
+        patch = self.occ_grid[r0:r1, c0:c1]
+        return not np.any(patch > 0)
+
+    # ==========================================================
     # Frontier detection
     # ==========================================================
     def _find_frontiers(self) -> List[Tuple[float, float]]:
@@ -283,6 +296,10 @@ class FrontierPotentialFieldExplorer(Node):
             return []
         rx, ry, _ = pose
 
+        clearance_cells = int(math.ceil(
+            self.get_parameter("min_goal_wall_clearance_m").value / self.map_resolution
+        ))
+
         # For each cluster, pick a goal point and compute distance
         goals = []
         for cluster in clusters:
@@ -292,22 +309,31 @@ class FrontierPotentialFieldExplorer(Node):
             cr = int(round(sum(rows) / len(rows)))
             cc = int(round(sum(cols) / len(cols)))
 
-            # If centroid is not free in planning grid, pick closest cluster cell to robot
+            goal_cell = None
+            # If centroid is free in planning grid AND clear of walls, use it
             if (0 <= cr < self.map_H and 0 <= cc < self.map_W
-                    and self.planning_grid[cr, cc] == 0):
-                gx, gy = og_grid_to_world(cr, cc, self.map_origin, self.map_resolution)
+                    and self.planning_grid[cr, cc] == 0
+                    and self._cell_clear_of_walls(cr, cc, clearance_cells)):
+                goal_cell = (cr, cc)
             else:
+                # Pick closest cluster cell to robot that is free and clear of walls
                 best_dist = float('inf')
-                best_cell = cluster[0]
                 for cell_r, cell_c in cluster:
+                    if self.planning_grid[cell_r, cell_c] != 0:
+                        continue
+                    if not self._cell_clear_of_walls(cell_r, cell_c, clearance_cells):
+                        continue
                     wx, wy = og_grid_to_world(cell_r, cell_c, self.map_origin, self.map_resolution)
                     d = math.hypot(wx - rx, wy - ry)
-                    if d < best_dist and self.planning_grid[cell_r, cell_c] == 0:
+                    if d < best_dist:
                         best_dist = d
-                        best_cell = (cell_r, cell_c)
-                gx, gy = og_grid_to_world(best_cell[0], best_cell[1],
-                                           self.map_origin, self.map_resolution)
+                        goal_cell = (cell_r, cell_c)
 
+            if goal_cell is None:
+                continue  # skip cluster — no safe goal candidate
+
+            gx, gy = og_grid_to_world(goal_cell[0], goal_cell[1],
+                                       self.map_origin, self.map_resolution)
             dist = math.hypot(gx - rx, gy - ry)
             goals.append((dist, gx, gy))
 
