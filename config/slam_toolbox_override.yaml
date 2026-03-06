@@ -8,3 +8,16 @@ slam_toolbox:
     max_laser_range: 5.0
     ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
     ceres_preconditioner: SCHUR_JACOBI
+
+    # Disable loop closing — prevents sudden map jumps/drift
+    do_loop_closing: false
+
+    # Tighter scan matching: smaller search space, higher quality threshold
+    correlation_search_space_dimension: 0.3
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.03
+    link_match_minimum_response_fine: 0.4
+    link_scan_maximum_distance: 1.0
+
+    # Conservative fine search angle (less chance of wrong orientation match)
+    fine_search_angle_offset: 0.00349
