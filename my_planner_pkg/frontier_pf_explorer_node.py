@@ -81,7 +81,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("min_goal_wall_clearance_m", 0.5)
         self.declare_parameter("visited_goal_radius_m", 0.8)
         self.declare_parameter("stuck_window_s", 4.0)
-        self.declare_parameter("stuck_threshold_m", 0.15)
+        self.declare_parameter("stuck_threshold_m", 0.35)
 
         self.declare_parameter("random_walk_turn_duration_s", 6.0)
         self.declare_parameter("random_walk_move_duration_s", 6.0)
@@ -464,11 +464,11 @@ class FrontierPotentialFieldExplorer(Node):
         if (now - self.pose_history[0][0]) < window:
             return False
 
-        # Check max displacement from current position
-        for t, px, py in self.pose_history:
-            if math.hypot(px - x, py - y) > threshold:
-                return False
-        return True
+        # Bounding box of all positions in the window — catches oscillation
+        xs = [px for _, px, _ in self.pose_history]
+        ys = [py for _, _, py in self.pose_history]
+        spread = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        return spread < threshold
 
     # ==========================================================
     # Main control loop (20 Hz)
