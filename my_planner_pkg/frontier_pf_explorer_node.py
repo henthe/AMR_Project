@@ -61,14 +61,14 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("map_topic", "/map")
 
-        self.declare_parameter("inflation_radius_m", 0.35)
+        self.declare_parameter("inflation_radius_m", 0.4)
         self.declare_parameter("allow_diagonal", True)
         self.declare_parameter("waypoint_every_n_cells", 20)
         self.declare_parameter("waypoints_include_turns", True)
 
-        self.declare_parameter("k_att", 1.0)
-        self.declare_parameter("k_rep", 1.0)
-        self.declare_parameter("repulsion_range_m", 0.6)
+        self.declare_parameter("k_att", 0.8)
+        self.declare_parameter("k_rep", 5.0)
+        self.declare_parameter("repulsion_range_m", 0.4)
         self.declare_parameter("stop_range_m", 0.25)
         self.declare_parameter("k_heading", 2.0)
         self.declare_parameter("max_lin", 0.7)
@@ -77,7 +77,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("goal_reached_dist_m", 0.30)
 
         self.declare_parameter("min_frontier_cluster", 5)
-        self.declare_parameter("visited_goal_radius_m", 0.5)
+        self.declare_parameter("visited_goal_radius_m", 0.4)
         self.declare_parameter("stuck_window_s", 10.0)
         self.declare_parameter("stuck_threshold_m", 0.05)
 
