@@ -586,8 +586,15 @@ class FrontierPotentialFieldExplorer(Node):
 
         if not frontiers:
             if not self._ever_navigated:
-                # Not ready yet (e.g. TF not available) — retry on next map update
-                self._map_updated = True
+                # Map too small (all frontiers within reach) or TF not ready.
+                # Random walk to let SLAM expand the map.
+                if self._get_robot_pose() is not None:
+                    self.get_logger().info(
+                        "Initial map too small — random walk to expand SLAM map"
+                    )
+                    self.rw_phase = 'turn'
+                    self.rw_phase_start = self.get_clock().now().nanoseconds / 1e9
+                    self.state = State.RANDOM_WALK
                 return
             self.get_logger().info("Exploration complete: no frontier clusters found.")
             self.state = State.DONE
@@ -613,8 +620,13 @@ class FrontierPotentialFieldExplorer(Node):
                 return
 
         if not self._ever_navigated:
-            # Can't plan yet — retry on next map update
-            self._map_updated = True
+            # Can't plan to any frontier yet — random walk to expand map
+            self.get_logger().info(
+                "Cannot plan to any frontier — random walk to expand SLAM map"
+            )
+            self.rw_phase = 'turn'
+            self.rw_phase_start = self.get_clock().now().nanoseconds / 1e9
+            self.state = State.RANDOM_WALK
             return
         self.get_logger().info(
             "Exploration complete: cannot plan path to any frontier."
