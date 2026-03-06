@@ -10,9 +10,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
+from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
 from tf2_ros import TransformException
@@ -146,10 +147,15 @@ class FrontierPotentialFieldExplorer(Node):
             qos_profile_sensor_data,
         )
 
-        # --- Publisher ---
+        # --- Publishers ---
         self.cmd_pub = self.create_publisher(
             Twist,
             self.get_parameter("cmd_vel_topic").value,
+            10,
+        )
+        self.marker_pub = self.create_publisher(
+            MarkerArray,
+            "~/viz_waypoints",
             10,
         )
 
@@ -443,6 +449,94 @@ class FrontierPotentialFieldExplorer(Node):
         elif self.state == State.DONE:
             self._handle_done()
 
+    # ==========================================================
+    # RViz visualization
+    # ==========================================================
+    def _publish_viz_markers(self):
+        ma = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+        frame = self.get_parameter("map_frame").value
+
+        # --- Goal marker (red sphere) ---
+        goal_marker = Marker()
+        goal_marker.header.stamp = stamp
+        goal_marker.header.frame_id = frame
+        goal_marker.ns = "goal"
+        goal_marker.id = 0
+        goal_marker.type = Marker.SPHERE
+        goal_marker.scale.x = 0.25
+        goal_marker.scale.y = 0.25
+        goal_marker.scale.z = 0.25
+        goal_marker.color.a = 1.0
+        if self.goal_world is not None:
+            goal_marker.action = Marker.ADD
+            goal_marker.pose.position.x = self.goal_world[0]
+            goal_marker.pose.position.y = self.goal_world[1]
+            goal_marker.pose.position.z = 0.15
+            goal_marker.pose.orientation.w = 1.0
+            goal_marker.color.r = 1.0
+        else:
+            goal_marker.action = Marker.DELETE
+        ma.markers.append(goal_marker)
+
+        # --- Waypoint spheres (green, current = yellow) ---
+        for i, (wx, wy) in enumerate(self.waypoints_world):
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = frame
+            m.ns = "waypoints"
+            m.id = i
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = wx
+            m.pose.position.y = wy
+            m.pose.position.z = 0.1
+            m.pose.orientation.w = 1.0
+            m.scale.x = 0.12
+            m.scale.y = 0.12
+            m.scale.z = 0.12
+            m.color.a = 1.0
+            if i == self.wp_index:
+                m.color.r = 1.0
+                m.color.g = 1.0
+            else:
+                m.color.g = 1.0
+            ma.markers.append(m)
+
+        # Delete stale waypoint markers from previous (longer) paths
+        for i in range(len(self.waypoints_world), len(self.waypoints_world) + 50):
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = frame
+            m.ns = "waypoints"
+            m.id = i
+            m.action = Marker.DELETE
+            ma.markers.append(m)
+
+        # --- Path line strip (blue) ---
+        line = Marker()
+        line.header.stamp = stamp
+        line.header.frame_id = frame
+        line.ns = "path"
+        line.id = 0
+        line.type = Marker.LINE_STRIP
+        line.scale.x = 0.04
+        line.color.a = 0.8
+        line.color.b = 1.0
+        if len(self.waypoints_world) >= 2:
+            line.action = Marker.ADD
+            for wx, wy in self.waypoints_world:
+                p = Point()
+                p.x = wx
+                p.y = wy
+                p.z = 0.05
+                line.points.append(p)
+        else:
+            line.action = Marker.DELETE
+        ma.markers.append(line)
+
+        self.marker_pub.publish(ma)
+
     def _handle_find_frontier(self):
         if self.occ_grid is None or not self._map_updated:
             return  # still waiting for (updated) map
@@ -485,6 +579,7 @@ class FrontierPotentialFieldExplorer(Node):
                 self.pose_history.clear()
                 self._ever_navigated = True
                 self.state = State.NAVIGATE
+                self._publish_viz_markers()
                 return
 
         if not self._ever_navigated:
@@ -572,6 +667,7 @@ class FrontierPotentialFieldExplorer(Node):
                 f"Following waypoint {self.wp_index + 1}/{total_wps} "
                 f"at ({wx:.2f}, {wy:.2f})"
             )
+            self._publish_viz_markers()
 
         # --- Also check goal distance directly ---
         goal_reached_dist = float(self.get_parameter("goal_reached_dist_m").value)
@@ -595,6 +691,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.wp_index = 0
         self.goal_world = None
         self.pose_history.clear()
+        self._publish_viz_markers()
         self.state = State.FIND_FRONTIER
 
     def _potential_field_step(self, x: float, y: float, yaw: float,
