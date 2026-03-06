@@ -15,3 +15,7 @@ logging (the robot should log different steps):
 -when he choses a new milestone from the path
 -when he starts randomwalk (and also which phase exactly: turn, move)
 -when he has finished randomwalk
+
+
+rviz:
+-we want to always display the goal and waypoints of the current path in rviz so this needs to be published

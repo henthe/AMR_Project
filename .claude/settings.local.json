@@ -16,7 +16,9 @@
       "Bash(git add -f README.md)",
       "Bash(git hash-object README.md)",
       "Bash(git config core.autocrlf)",
-      "Bash(git add --renormalize README.md)"
+      "Bash(git add --renormalize README.md)",
+      "mcp__github__search_code",
+      "mcp__github__get_file_contents"
     ]
   }
 }
