@@ -77,6 +77,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("goal_reached_dist_m", 0.30)
 
         self.declare_parameter("min_frontier_cluster", 5)
+        self.declare_parameter("visited_goal_radius_m", 0.5)
         self.declare_parameter("stuck_window_s", 10.0)
         self.declare_parameter("stuck_threshold_m", 0.05)
 
@@ -109,8 +110,15 @@ class FrontierPotentialFieldExplorer(Node):
         self.rw_phase: Optional[str] = None  # 'turn' or 'move'
         self.rw_phase_start: float = 0.0
 
+        # Blacklist of recently visited goal locations
+        self._visited_goals: List[Tuple[float, float]] = []
+
         # Done flag (log only once)
         self._done_logged = False
+
+        # Track whether navigation has ever started (to distinguish
+        # "not ready yet" from "truly no frontiers left")
+        self._ever_navigated = False
 
         # Track whether map has been updated since last frontier search
         self._map_updated = False
@@ -298,7 +306,18 @@ class FrontierPotentialFieldExplorer(Node):
             goals.append((dist, gx, gy))
 
         goals.sort(key=lambda t: t[0])
-        return [(g[1], g[2]) for g in goals]
+
+        # Filter out goals too close to already-visited locations
+        visited_radius = self.get_parameter("visited_goal_radius_m").value
+        filtered = []
+        for _, gx, gy in goals:
+            too_close = any(
+                math.hypot(gx - vx, gy - vy) < visited_radius
+                for vx, vy in self._visited_goals
+            )
+            if not too_close:
+                filtered.append((gx, gy))
+        return filtered
 
     # ==========================================================
     # Path planning to a goal
@@ -431,32 +450,51 @@ class FrontierPotentialFieldExplorer(Node):
 
         frontiers = self._find_frontiers()
         if not frontiers:
+            # If we have blacklisted goals, clear them and retry — the map may
+            # have changed enough that revisiting those areas finds new frontiers.
+            if self._visited_goals:
+                self.get_logger().info(
+                    f"No new frontiers found. Clearing {len(self._visited_goals)} "
+                    f"visited goals and retrying."
+                )
+                self._visited_goals.clear()
+                frontiers = self._find_frontiers()
+
+        if not frontiers:
+            if not self._ever_navigated:
+                # Not ready yet (e.g. TF not available) — retry on next map update
+                self._map_updated = True
+                return
             self.get_logger().info("Exploration complete: no frontier clusters found.")
             self.state = State.DONE
             return
 
-        # Try closest frontier
-        gx, gy = frontiers[0]
-        if self._plan_to_goal(gx, gy):
-            dist = math.hypot(gx - self.waypoints_world[0][0], gy - self.waypoints_world[0][1]) if self.waypoints_world else 0.0
-            pose = self._get_robot_pose()
-            if pose:
-                dist = math.hypot(gx - pose[0], gy - pose[1])
-            self.get_logger().info(
-                f"New goal at ({gx:.2f}, {gy:.2f}), distance: {dist:.2f} m, "
-                f"waypoints: {len(self.waypoints_world)}"
-            )
-            self.get_logger().info(
-                f"Following waypoint 1/{len(self.waypoints_world)} at "
-                f"({self.waypoints_world[0][0]:.2f}, {self.waypoints_world[0][1]:.2f})"
-            )
-            self.pose_history.clear()
-            self.state = State.NAVIGATE
-        else:
-            self.get_logger().info(
-                "Exploration complete: cannot create path to closest frontier."
-            )
-            self.state = State.DONE
+        # Try each frontier, not just the closest
+        for gx, gy in frontiers:
+            if self._plan_to_goal(gx, gy):
+                pose = self._get_robot_pose()
+                dist = math.hypot(gx - pose[0], gy - pose[1]) if pose else 0.0
+                self.get_logger().info(
+                    f"New goal at ({gx:.2f}, {gy:.2f}), distance: {dist:.2f} m, "
+                    f"waypoints: {len(self.waypoints_world)}"
+                )
+                self.get_logger().info(
+                    f"Following waypoint 1/{len(self.waypoints_world)} at "
+                    f"({self.waypoints_world[0][0]:.2f}, {self.waypoints_world[0][1]:.2f})"
+                )
+                self.pose_history.clear()
+                self._ever_navigated = True
+                self.state = State.NAVIGATE
+                return
+
+        if not self._ever_navigated:
+            # Can't plan yet — retry on next map update
+            self._map_updated = True
+            return
+        self.get_logger().info(
+            "Exploration complete: cannot plan path to any frontier."
+        )
+        self.state = State.DONE
 
     def _handle_navigate(self):
         if self.scan is None:
@@ -551,6 +589,7 @@ class FrontierPotentialFieldExplorer(Node):
             self.get_logger().info(
                 f"Goal reached at ({self.goal_world[0]:.2f}, {self.goal_world[1]:.2f})"
             )
+            self._visited_goals.append(self.goal_world)
         self.cmd_pub.publish(Twist())
         self.waypoints_world.clear()
         self.wp_index = 0
