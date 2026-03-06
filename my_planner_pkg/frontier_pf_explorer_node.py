@@ -81,7 +81,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("min_goal_wall_clearance_m", 0.5)
         self.declare_parameter("visited_goal_radius_m", 0.8)
         self.declare_parameter("stuck_window_s", 4.0)
-        self.declare_parameter("stuck_threshold_m", 0.35)
+        self.declare_parameter("stuck_threshold_m", 0.8)
 
         self.declare_parameter("random_walk_turn_duration_s", 6.0)
         self.declare_parameter("random_walk_move_duration_s", 6.0)
@@ -106,7 +106,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.scan: Optional[LaserScan] = None
 
         # Stuck detection
-        self.pose_history: List[Tuple[float, float, float, float]] = []  # (time_s, x, y, wp_dist)
+        self.pose_history: List[Tuple[float, float, float]] = []  # (time_s, x, y)
 
         # Random walk
         self.rw_phase: Optional[str] = None  # 'turn' or 'move'
@@ -446,9 +446,9 @@ class FrontierPotentialFieldExplorer(Node):
     # ==========================================================
     # Stuck detection
     # ==========================================================
-    def _is_stuck(self, x: float, y: float, wp_dist: float) -> bool:
+    def _is_stuck(self, x: float, y: float) -> bool:
         now = self.get_clock().now().nanoseconds / 1e9
-        self.pose_history.append((now, x, y, wp_dist))
+        self.pose_history.append((now, x, y))
 
         window = self.get_parameter("stuck_window_s").value
         threshold = self.get_parameter("stuck_threshold_m").value
@@ -464,20 +464,11 @@ class FrontierPotentialFieldExplorer(Node):
         if (now - self.pose_history[0][0]) < window:
             return False
 
-        # Check 1: position bounding box (catches staying in place)
-        xs = [px for _, px, _, _ in self.pose_history]
-        ys = [py for _, _, py, _ in self.pose_history]
+        # Bounding box of all positions — catches both staying in place and oscillation
+        xs = [px for _, px, _ in self.pose_history]
+        ys = [py for _, _, py in self.pose_history]
         spread = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
-        if spread < threshold:
-            return True
-
-        # Check 2: no progress toward waypoint (catches oscillation near walls)
-        oldest_wp_dist = self.pose_history[0][3]
-        progress = oldest_wp_dist - wp_dist
-        if progress < threshold:
-            return True
-
-        return False
+        return spread < threshold
 
     # ==========================================================
     # Main control loop (20 Hz)
@@ -687,9 +678,8 @@ class FrontierPotentialFieldExplorer(Node):
                 self.state = State.FIND_FRONTIER
                 return
 
-        # --- Stuck detection (uses goal distance — stable across waypoint advances) ---
-        goal_dist_now = math.hypot(self.goal_world[0] - x, self.goal_world[1] - y) if self.goal_world else 0.0
-        if self._is_stuck(x, y, goal_dist_now):
+        # --- Stuck detection ---
+        if self._is_stuck(x, y):
             self.get_logger().warn(
                 f"Stuck at ({x:.2f}, {y:.2f}), starting random walk"
             )
