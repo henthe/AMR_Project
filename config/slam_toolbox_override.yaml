@@ -1,8 +1,10 @@
 slam_toolbox:
   ros__parameters:
     use_sim_time: true
-    map_update_interval: 0.02
-    minimum_travel_distance: 0.01
-    minimum_travel_heading: 0.05
+    map_update_interval: 1.0
+    minimum_travel_distance: 0.3
+    minimum_travel_heading: 0.3
     min_laser_range: 0.12
     max_laser_range: 5.0
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
