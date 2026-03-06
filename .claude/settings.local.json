@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add CLAUDE.md SUMMARY.md readme.md)",
+      "Bash(git commit:*)",
+      "Bash(git push)",
+      "Bash(git add CLAUDE.md SUMMARY.md my_planner_pkg/frontier_explorer_node.py my_planner_pkg/frontier_pf_explorer_node.py)",
+      "Bash(git add my_planner_pkg/frontier_pf_explorer_node.py)",
+      "Bash(git add config/slam_toolbox_override.yaml my_planner_pkg/frontier_pf_explorer_node.py)",
+      "Bash(git add CLAUDE.md SUMMARY.md my_planner_pkg/frontier_pf_explorer_node.py setup.py README.md readme.md)",
+      "Bash(git add config/slam_toolbox_override.yaml)",
+      "Bash(git add my_planner_pkg/frontier_pf_explorer_node.py config/slam_toolbox_override.yaml)",
+      "Bash(git add my_planner_pkg/frontier_pf_explorer_node.py SUMMARY.md)",
+      "Bash(git add my_planner_pkg/frontier_pf_explorer_node.py SUMMARY.md README.md)",
+      "Bash(git add README.md)",
+      "Bash(git add -f README.md)",
+      "Bash(git hash-object README.md)",
+      "Bash(git config core.autocrlf)",
+      "Bash(git add --renormalize README.md)"
+    ]
+  }
+}
