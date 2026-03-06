@@ -122,6 +122,10 @@ class FrontierPotentialFieldExplorer(Node):
         # "not ready yet" from "truly no frontiers left")
         self._ever_navigated = False
 
+        # Count consecutive random walks without finding a valid frontier
+        self._no_frontier_rw_count = 0
+        self._max_no_frontier_rw = 3
+
         # Track whether map has been updated since last frontier search
         self._map_updated = False
 
@@ -585,16 +589,17 @@ class FrontierPotentialFieldExplorer(Node):
                 frontiers = self._find_frontiers()
 
         if not frontiers:
-            if not self._ever_navigated:
-                # Map too small (all frontiers within reach) or TF not ready.
-                # Random walk to let SLAM expand the map.
-                if self._get_robot_pose() is not None:
-                    self.get_logger().info(
-                        "Initial map too small — random walk to expand SLAM map"
-                    )
-                    self.rw_phase = 'turn'
-                    self.rw_phase_start = self.get_clock().now().nanoseconds / 1e9
-                    self.state = State.RANDOM_WALK
+            if self._get_robot_pose() is None:
+                return  # TF not ready yet
+            if self._no_frontier_rw_count < self._max_no_frontier_rw:
+                self._no_frontier_rw_count += 1
+                self.get_logger().info(
+                    f"No valid frontiers — random walk to expand map "
+                    f"(attempt {self._no_frontier_rw_count}/{self._max_no_frontier_rw})"
+                )
+                self.rw_phase = 'turn'
+                self.rw_phase_start = self.get_clock().now().nanoseconds / 1e9
+                self.state = State.RANDOM_WALK
                 return
             self.get_logger().info("Exploration complete: no frontier clusters found.")
             self.state = State.DONE
@@ -615,14 +620,16 @@ class FrontierPotentialFieldExplorer(Node):
                 )
                 self.pose_history.clear()
                 self._ever_navigated = True
+                self._no_frontier_rw_count = 0
                 self.state = State.NAVIGATE
                 self._publish_viz_markers()
                 return
 
-        if not self._ever_navigated:
-            # Can't plan to any frontier yet — random walk to expand map
+        if self._no_frontier_rw_count < self._max_no_frontier_rw:
+            self._no_frontier_rw_count += 1
             self.get_logger().info(
-                "Cannot plan to any frontier — random walk to expand SLAM map"
+                f"Cannot plan to any frontier — random walk to expand map "
+                f"(attempt {self._no_frontier_rw_count}/{self._max_no_frontier_rw})"
             )
             self.rw_phase = 'turn'
             self.rw_phase_start = self.get_clock().now().nanoseconds / 1e9
