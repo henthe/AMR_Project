@@ -72,8 +72,8 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("repulsion_range_m", 0.4)
         self.declare_parameter("stop_range_m", 0.25)
         self.declare_parameter("k_heading", 2.0)
-        self.declare_parameter("max_lin", 0.7)
-        self.declare_parameter("max_ang", 1.5)
+        self.declare_parameter("max_lin", 1.0)
+        self.declare_parameter("max_ang", 2.0)
         self.declare_parameter("wp_reached_dist_m", 0.20)
         self.declare_parameter("goal_reached_dist_m", 0.50)
 
@@ -85,8 +85,8 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.declare_parameter("random_walk_turn_duration_s", 6.0)
         self.declare_parameter("random_walk_move_duration_s", 6.0)
-        self.declare_parameter("random_walk_angular_speed", 0.8)
-        self.declare_parameter("random_walk_linear_speed", 0.7)
+        self.declare_parameter("random_walk_angular_speed", 1.0)
+        self.declare_parameter("random_walk_linear_speed", 1.0)
 
         # --- State ---
         self.state = State.FIND_FRONTIER
@@ -453,8 +453,8 @@ class FrontierPotentialFieldExplorer(Node):
         window = self.get_parameter("stuck_window_s").value
         threshold = self.get_parameter("stuck_threshold_m").value
 
-        # Prune old entries
-        while self.pose_history and (now - self.pose_history[0][0]) > window:
+        # Prune old entries (keep slightly beyond window so the check works)
+        while self.pose_history and (now - self.pose_history[0][0]) > window + 0.5:
             self.pose_history.pop(0)
 
         if not self.pose_history:
@@ -852,7 +852,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         heading_factor = max(0.0, math.cos(heading_err))
         lin = clamp(
-            0.6 * heading_factor * self.get_parameter("max_lin").value,
+            0.8 * heading_factor * self.get_parameter("max_lin").value,
             0.0,
             self.get_parameter("max_lin").value,
         )
