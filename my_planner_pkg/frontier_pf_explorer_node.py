@@ -78,7 +78,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("goal_reached_dist_m", 0.50)
 
         self.declare_parameter("min_frontier_cluster", 5)
-        self.declare_parameter("min_goal_wall_clearance_m", 0.7)
+        self.declare_parameter("min_goal_wall_clearance_m", 0.5)
         self.declare_parameter("visited_goal_radius_m", 0.8)
         self.declare_parameter("stuck_window_s", 4.0)
         self.declare_parameter("stuck_threshold_m", 0.15)
