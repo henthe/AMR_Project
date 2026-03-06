@@ -62,7 +62,7 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("map_topic", "/map")
 
-        self.declare_parameter("inflation_radius_m", 0.4)
+        self.declare_parameter("inflation_radius_m", 0.6)
         self.declare_parameter("allow_diagonal", True)
         self.declare_parameter("waypoint_every_n_cells", 20)
         self.declare_parameter("waypoints_include_turns", True)
@@ -78,8 +78,8 @@ class FrontierPotentialFieldExplorer(Node):
         self.declare_parameter("goal_reached_dist_m", 0.50)
 
         self.declare_parameter("min_frontier_cluster", 5)
-        self.declare_parameter("min_goal_wall_clearance_m", 0.5)
-        self.declare_parameter("visited_goal_radius_m", 0.4)
+        self.declare_parameter("min_goal_wall_clearance_m", 0.7)
+        self.declare_parameter("visited_goal_radius_m", 0.8)
         self.declare_parameter("stuck_window_s", 4.0)
         self.declare_parameter("stuck_threshold_m", 0.15)
 
@@ -626,6 +626,34 @@ class FrontierPotentialFieldExplorer(Node):
             return
 
         x, y, yaw = pose
+
+        # --- Revalidate goal when map updates reveal walls nearby ---
+        if self._map_updated and self.goal_world is not None:
+            self._map_updated = False
+            gr, gc = og_world_to_grid(
+                self.goal_world[0], self.goal_world[1],
+                self.map_origin, self.map_resolution,
+            )
+            gr = clamp(gr, 0, self.map_H - 1)
+            gc = clamp(gc, 0, self.map_W - 1)
+            clearance_cells = int(math.ceil(
+                self.get_parameter("min_goal_wall_clearance_m").value
+                / self.map_resolution
+            ))
+            if not self._cell_clear_of_walls(int(gr), int(gc), clearance_cells):
+                self.get_logger().info(
+                    f"Goal ({self.goal_world[0]:.2f}, {self.goal_world[1]:.2f}) "
+                    f"now too close to wall — abandoning, finding new frontier"
+                )
+                self._visited_goals.append(self.goal_world)
+                self.cmd_pub.publish(Twist())
+                self.waypoints_world.clear()
+                self.wp_index = 0
+                self.goal_world = None
+                self.pose_history.clear()
+                self._publish_viz_markers()
+                self.state = State.FIND_FRONTIER
+                return
 
         # --- Stuck detection ---
         if self._is_stuck(x, y):
