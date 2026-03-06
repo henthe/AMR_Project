@@ -339,6 +339,10 @@ class FrontierPotentialFieldExplorer(Node):
 
         goals.sort(key=lambda t: t[0])
 
+        # Filter out goals already within goal_reached_dist (would be instant "reached")
+        min_dist = self.get_parameter("goal_reached_dist_m").value
+        goals = [(d, gx, gy) for d, gx, gy in goals if d > min_dist]
+
         # Filter out goals too close to already-visited locations
         visited_radius = self.get_parameter("visited_goal_radius_m").value
         filtered = []
