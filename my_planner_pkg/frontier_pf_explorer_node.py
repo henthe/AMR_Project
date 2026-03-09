@@ -163,6 +163,11 @@ class FrontierPotentialFieldExplorer(Node):
             "~/viz_waypoints",
             10,
         )
+        self.map_viz_pub = self.create_publisher(
+            OccupancyGrid,
+            "~/map",
+            map_qos,
+        )
 
         # --- Control loop at 20 Hz ---
         self.timer = self.create_timer(0.05, self.control_loop)
@@ -188,6 +193,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.planning_grid = self._build_planning_grid()
         self._map_updated = True
+        self.map_viz_pub.publish(msg)
 
     def on_scan(self, msg: LaserScan):
         self.scan = msg
