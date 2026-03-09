@@ -9,9 +9,10 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from geometry_msgs.msg import Twist, PoseStamped, Point
+from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -286,6 +287,14 @@ class GlobalAStarPotentialFieldNode(Node):
         self.cmd_pub = self.create_publisher(Twist, self.get_parameter("cmd_vel_topic").value, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/planner_markers", 10)
 
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
+        self.map_pub = self.create_publisher(OccupancyGrid, "/map", map_qos)
+        self._publish_map()
+
         self.timer = self.create_timer(0.05, self.control_loop)
 
         self.get_logger().info(
@@ -325,6 +334,26 @@ class GlobalAStarPotentialFieldNode(Node):
             grid[inflated == 0] = 0
 
         return grid
+
+    def _publish_map(self):
+        msg = OccupancyGrid()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.get_parameter("map_frame").value
+        msg.info.resolution = self.resolution
+        msg.info.width = self.W
+        msg.info.height = self.H
+        msg.info.origin.position.x = self.origin[0]
+        msg.info.origin.position.y = self.origin[1]
+        yaw = self.origin[2]
+        msg.info.origin.orientation.z = math.sin(yaw / 2.0)
+        msg.info.origin.orientation.w = math.cos(yaw / 2.0)
+
+        # Flip vertically: YAML map has row 0 at top, OccupancyGrid starts from origin (bottom)
+        # Cast uint8->int8: 255 (unknown) becomes -1 automatically
+        data = np.flipud(self.occ).astype(np.int8)
+        msg.data = data.flatten().tolist()
+        self.map_pub.publish(msg)
+        self.get_logger().info("Published map to /map")
 
     def on_goal(self, msg: PoseStamped):
         self.goal_world = (msg.pose.position.x, msg.pose.position.y)
