@@ -22,7 +22,8 @@ AMR_Project/                          # ROS 2 ament_python package root
 │   ├── __init__.py
 │   ├── planner_pf_node.py            # A* planner + potential field controller
 │   ├── particle_filter_localization.py  # Monte Carlo Localization (particle filter)
-│   └── frontier_pf_explorer_node.py  # Frontier exploration via potential fields
+│   ├── frontier_pf_explorer_node.py  # Frontier exploration via potential fields
+│   └── set_initial_pose.py           # One-shot initial pose publisher
 └── test/                             # Default ament lint tests (copyright, flake8, pep257)
 ```
 
@@ -80,6 +81,16 @@ AMR_Project/                          # ROS 2 ament_python package root
 - **Publishes:** `/cmd_vel` (Twist)
 - **TF:** Reads `map → base_link`
 - **Key parameters (defaults):** `inflation_radius_m` (0.35), `k_att` (1.0), `k_rep` (1.0), `repulsion_range_m` (0.6), `stop_range_m` (0.25), `k_heading` (2.0), `max_lin` (0.7), `max_ang` (1.5), `goal_reached_dist_m` (0.30), `wp_reached_dist_m` (0.20), `min_frontier_cluster` (5), `waypoint_every_n_cells` (20), `stuck_window_s` (10.0), `stuck_threshold_m` (0.05), `random_walk_turn_duration_s` (6.0), `random_walk_move_duration_s` (6.0), `random_walk_angular_speed` (0.8), `random_walk_linear_speed` (0.7)
+
+### 4. `set_initial_pose` — Static map → odom Transform Broadcaster
+- **Entry point:** `set_initial_pose = my_planner_pkg.set_initial_pose:main`
+- **Class:** `SetInitialPose`
+- **Purpose:** Broadcast a static `map → odom` TF transform so the planner can look up `map → base_link` without running a localizer. Useful when the robot always starts from a known position on a pre-built map.
+- **How it works:**
+  1. On startup, broadcasts a static `map → odom` transform using the provided x, y, theta parameters.
+  2. Stays alive (keeps the transform available) until killed.
+- **TF:** Broadcasts `map → odom` (static)
+- **Key parameters:** `x` (0.0), `y` (0.0), `theta` (0.0 rad)
 
 ## Shared Algorithms & Patterns
 
