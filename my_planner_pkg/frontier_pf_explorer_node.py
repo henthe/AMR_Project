@@ -50,6 +50,7 @@ class FrontierPotentialFieldExplorer(Node):
 
         self.declare_parameter("inflation_radius_m", 0.6)
         self.declare_parameter("min_frontier_cluster", 5)
+        self.declare_parameter("min_unknown_neighbors", 3)
         self.declare_parameter("min_goal_wall_clearance_m", 0.5)
         self.declare_parameter("visited_goal_radius_m", 0.8)
         self.declare_parameter("status_goal_tolerance_m", 0.2)
@@ -222,7 +223,7 @@ class FrontierPotentialFieldExplorer(Node):
         free_mask = grid == 0
         unknown_mask = grid == -1
 
-        has_unknown_neighbor = np.zeros(grid.shape, dtype=bool)
+        unknown_neighbor_count = np.zeros(grid.shape, dtype=np.int16)
         for dr, dc in [
             (-1, 0),
             (1, 0),
@@ -243,9 +244,10 @@ class FrontierPotentialFieldExplorer(Node):
             dst_c0 = max(0, dc)
             dst_c1 = w - max(0, -dc)
             shifted[dst_r0:dst_r1, dst_c0:dst_c1] = unknown_mask[src_r0:src_r1, src_c0:src_c1]
-            has_unknown_neighbor |= shifted
+            unknown_neighbor_count += shifted.astype(np.int16)
 
-        frontier_mask = free_mask & has_unknown_neighbor
+        min_unknown_neighbors = int(self.get_parameter("min_unknown_neighbors").value)
+        frontier_mask = free_mask & (unknown_neighbor_count >= min_unknown_neighbors)
         visited = np.zeros(grid.shape, dtype=bool)
         clusters: List[List[Tuple[int, int]]] = []
         frontier_coords = list(zip(*np.where(frontier_mask)))
