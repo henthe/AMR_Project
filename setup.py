@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import setup
 
 package_name = "my_planner_pkg"
@@ -9,7 +11,9 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        ("share/" + package_name + "/maps", ["maps/first_try.yaml", "maps/first_try.pgm"]),
+        ("share/" + package_name + "/maps", glob("maps/*")),
+        ("share/" + package_name + "/config", glob("config/*")),
+        ("share/" + package_name + "/launch", glob("launch/*.py")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -23,6 +27,7 @@ setup(
             "pf_localization = my_planner_pkg.particle_filter_localization:main",
             "frontier_pf_explorer = my_planner_pkg.frontier_pf_explorer_node:main",
             "set_initial_pose = my_planner_pkg.set_initial_pose:main",
+            "bootstrap_map_odom = my_planner_pkg.bootstrap_map_odom:main",
         ],
     },
 )

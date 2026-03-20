@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import math
 import heapq
+import os
 import yaml
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
@@ -11,6 +12,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
+from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
@@ -63,6 +65,35 @@ def load_map_from_yaml(yaml_path: str):
     occ_grid[p_occ <= free_thresh] = 0
 
     return occ_grid, resolution, origin
+
+
+def resolve_map_yaml_path(map_yaml: str, package_name: str = "my_planner_pkg") -> str:
+    raw = os.path.expanduser(map_yaml.strip())
+    if not raw:
+        return ""
+
+    candidates = []
+    if os.path.isabs(raw):
+        candidates.append(raw)
+    else:
+        candidates.append(os.path.abspath(raw))
+        try:
+            share_dir = get_package_share_directory(package_name)
+        except PackageNotFoundError:
+            share_dir = ""
+
+        if share_dir:
+            names = [raw]
+            if not raw.endswith(".yaml"):
+                names.append(f"{raw}.yaml")
+            for name in names:
+                candidates.append(os.path.join(share_dir, name))
+                candidates.append(os.path.join(share_dir, "maps", os.path.basename(name)))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
 
 
 # ----------------------------
@@ -226,6 +257,8 @@ class GlobalAStarPotentialFieldNode(Node):
 
         # Params
         self.declare_parameter("map_yaml", "first_try.yaml")
+        self.declare_parameter("map_topic", "/map")
+        self.declare_parameter("publish_map", True)
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("base_frame", "base_link")
 
@@ -251,14 +284,16 @@ class GlobalAStarPotentialFieldNode(Node):
         self.declare_parameter("wp_reached_dist_m", 0.20)
         self.declare_parameter("lin_scale_on_heading", 1.0)
 
-        # Load map
-        map_yaml = self.get_parameter("map_yaml").value
-        self.occ, self.resolution, self.origin = load_map_from_yaml(map_yaml)
-        self.H, self.W = self.occ.shape
-
         self.unknown_is_obstacle = self.get_parameter("unknown_is_obstacle").value
         self.inflation_radius_m = self.get_parameter("inflation_radius_m").value
-        self.grid = self._build_planning_grid(self.occ)
+        self.publish_map = bool(self.get_parameter("publish_map").value)
+
+        self.occ: Optional[np.ndarray] = None
+        self.resolution = 0.0
+        self.origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.H = 0
+        self.W = 0
+        self.grid: Optional[np.ndarray] = None
 
         self.goal_world: Optional[Tuple[float, float]] = None
         self.global_path_cells: List[Tuple[int, int]] = []
@@ -284,6 +319,21 @@ class GlobalAStarPotentialFieldNode(Node):
             self.on_scan,
             qos_profile_sensor_data,
         )
+        map_yaml = str(self.get_parameter("map_yaml").value).strip()
+        if not map_yaml:
+            map_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                depth=1,
+            )
+            self.map_sub = self.create_subscription(
+                OccupancyGrid,
+                self.get_parameter("map_topic").value,
+                self.on_map,
+                map_qos,
+            )
+        else:
+            self.map_sub = None
         self.cmd_pub = self.create_publisher(Twist, self.get_parameter("cmd_vel_topic").value, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/planner_markers", 10)
 
@@ -293,13 +343,9 @@ class GlobalAStarPotentialFieldNode(Node):
             depth=1,
         )
         self.map_pub = self.create_publisher(OccupancyGrid, "/map", map_qos)
-        self._publish_map()
+        self.try_load_map_from_file()
 
         self.timer = self.create_timer(0.05, self.control_loop)
-
-        self.get_logger().info(
-            f"Loaded map {self.W}x{self.H}, res={self.resolution:.3f}, origin={self.origin}"
-        )
 
     def _build_planning_grid(self, occ: np.ndarray) -> np.ndarray:
         grid = np.copy(occ)
@@ -335,7 +381,56 @@ class GlobalAStarPotentialFieldNode(Node):
 
         return grid
 
+    def _set_map(self, occ: np.ndarray, resolution: float, origin: Tuple[float, float, float]):
+        self.occ = occ
+        self.resolution = resolution
+        self.origin = origin
+        self.H, self.W = occ.shape
+        self.grid = self._build_planning_grid(occ)
+
+        self.get_logger().info(
+            f"Loaded map {self.W}x{self.H}, res={self.resolution:.3f}, origin={self.origin}"
+        )
+
+        self._publish_map()
+        if self.goal_world is not None:
+            self.plan_global()
+
+    def try_load_map_from_file(self):
+        map_yaml = str(self.get_parameter("map_yaml").value).strip()
+        if not map_yaml:
+            self.get_logger().info(
+                f"No map_yaml set. Waiting for map on {self.get_parameter('map_topic').value}."
+            )
+            return
+
+        resolved_path = resolve_map_yaml_path(map_yaml)
+        if not os.path.exists(resolved_path):
+            self.get_logger().error(f"Map YAML not found: {resolved_path}")
+            return
+
+        occ, resolution, origin = load_map_from_yaml(resolved_path)
+        self._set_map(occ, resolution, origin)
+
+    def on_map(self, msg: OccupancyGrid):
+        raw = np.array(msg.data, dtype=np.int16).reshape((msg.info.height, msg.info.width))
+        occ = np.flipud(raw)
+        occ[occ < 0] = 255
+        occ = occ.astype(np.uint8)
+
+        q = msg.info.origin.orientation
+        yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        origin = (
+            float(msg.info.origin.position.x),
+            float(msg.info.origin.position.y),
+            float(yaw),
+        )
+        self._set_map(occ, float(msg.info.resolution), origin)
+
     def _publish_map(self):
+        if not self.publish_map or self.occ is None:
+            return
+
         msg = OccupancyGrid()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.get_parameter("map_frame").value
@@ -382,6 +477,10 @@ class GlobalAStarPotentialFieldNode(Node):
         return (x, y, yaw)
 
     def plan_global(self):
+        if self.grid is None or self.occ is None:
+            self.get_logger().warn("Cannot plan yet: map not available.")
+            return
+
         pose = self.get_robot_pose_map()
         if pose is None or self.goal_world is None:
             self.get_logger().warn("Cannot plan yet: missing TF pose or goal.")
@@ -464,7 +563,7 @@ class GlobalAStarPotentialFieldNode(Node):
         self.marker_pub.publish(ma)
 
     def control_loop(self):
-        if self.scan is None:
+        if self.scan is None or self.grid is None:
             return
 
         pose = self.get_robot_pose_map()
