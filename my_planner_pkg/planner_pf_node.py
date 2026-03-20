@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+import json
 import math
 import heapq
 import os
 import yaml
 from dataclasses import dataclass
+from collections import deque
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -16,6 +18,7 @@ from ament_index_python.packages import PackageNotFoundError, get_package_share_
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
@@ -263,6 +266,7 @@ class GlobalAStarPotentialFieldNode(Node):
         self.declare_parameter("base_frame", "base_link")
 
         self.declare_parameter("goal_topic", "/goal_pose")
+        self.declare_parameter("status_topic", "/planner_pf/status")
         self.declare_parameter("scan_topic", "/scan")
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
 
@@ -283,6 +287,8 @@ class GlobalAStarPotentialFieldNode(Node):
         self.declare_parameter("max_ang", 1.5)
         self.declare_parameter("wp_reached_dist_m", 0.20)
         self.declare_parameter("lin_scale_on_heading", 1.0)
+        self.declare_parameter("stuck_window_s", 8.0)
+        self.declare_parameter("stuck_threshold_m", 0.8)
 
         self.unknown_is_obstacle = self.get_parameter("unknown_is_obstacle").value
         self.inflation_radius_m = self.get_parameter("inflation_radius_m").value
@@ -299,6 +305,8 @@ class GlobalAStarPotentialFieldNode(Node):
         self.global_path_cells: List[Tuple[int, int]] = []
         self.waypoints_world: List[Tuple[float, float]] = []
         self.wp_index = 0
+        self.pose_history: List[Tuple[float, float, float]] = []
+        self.nav_state = "idle"
 
         self.scan: Optional[LaserScan] = None
 
@@ -336,6 +344,16 @@ class GlobalAStarPotentialFieldNode(Node):
             self.map_sub = None
         self.cmd_pub = self.create_publisher(Twist, self.get_parameter("cmd_vel_topic").value, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/planner_markers", 10)
+        status_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
+        self.status_pub = self.create_publisher(
+            String,
+            self.get_parameter("status_topic").value,
+            status_qos,
+        )
 
         map_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -344,8 +362,54 @@ class GlobalAStarPotentialFieldNode(Node):
         )
         self.map_pub = self.create_publisher(OccupancyGrid, "/map", map_qos)
         self.try_load_map_from_file()
+        self._publish_status("idle", "planner_ready")
 
         self.timer = self.create_timer(0.05, self.control_loop)
+
+    def _publish_status(self, state: str, message: str = ""):
+        self.nav_state = state
+        payload = {
+            "state": state,
+            "goal": None,
+            "message": message,
+        }
+        if self.goal_world is not None:
+            payload["goal"] = {
+                "x": float(self.goal_world[0]),
+                "y": float(self.goal_world[1]),
+            }
+
+        msg = String()
+        msg.data = json.dumps(payload, separators=(",", ":"))
+        self.status_pub.publish(msg)
+
+    def _clear_navigation(self, clear_goal: bool):
+        self.global_path_cells = []
+        self.waypoints_world = []
+        self.wp_index = 0
+        self.pose_history.clear()
+        if clear_goal:
+            self.goal_world = None
+
+    def _is_stuck(self, x: float, y: float) -> bool:
+        now = self.get_clock().now().nanoseconds / 1e9
+        self.pose_history.append((now, x, y))
+
+        window = float(self.get_parameter("stuck_window_s").value)
+        threshold = float(self.get_parameter("stuck_threshold_m").value)
+
+        while self.pose_history and (now - self.pose_history[0][0]) > window + 0.5:
+            self.pose_history.pop(0)
+
+        if not self.pose_history:
+            return False
+        if (now - self.pose_history[0][0]) < window:
+            return False
+
+        xs = [px for _, px, _ in self.pose_history]
+        ys = [py for _, _, py in self.pose_history]
+        spread = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        return spread < threshold
 
     def _build_planning_grid(self, occ: np.ndarray) -> np.ndarray:
         grid = np.copy(occ)
@@ -380,6 +444,25 @@ class GlobalAStarPotentialFieldNode(Node):
             grid[inflated == 0] = 0
 
         return grid
+
+    def _nearest_free_cell(self, cell: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+        if self.grid is None:
+            return None
+
+        visited = {cell}
+        queue = deque([cell])
+        while queue:
+            r, c = queue.popleft()
+            if 0 <= r < self.H and 0 <= c < self.W and self.grid[r, c] == 0:
+                return (r, c)
+
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr = r + dr
+                nc = c + dc
+                if 0 <= nr < self.H and 0 <= nc < self.W and (nr, nc) not in visited:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+        return None
 
     def _set_map(self, occ: np.ndarray, resolution: float, origin: Tuple[float, float, float]):
         self.occ = occ
@@ -452,7 +535,9 @@ class GlobalAStarPotentialFieldNode(Node):
 
     def on_goal(self, msg: PoseStamped):
         self.goal_world = (msg.pose.position.x, msg.pose.position.y)
+        self.pose_history.clear()
         self.get_logger().info(f"Goal: ({self.goal_world[0]:.2f}, {self.goal_world[1]:.2f})")
+        self._publish_status("planning", "goal_received")
         self.plan_global()
 
     def on_scan(self, msg: LaserScan):
@@ -479,11 +564,14 @@ class GlobalAStarPotentialFieldNode(Node):
     def plan_global(self):
         if self.grid is None or self.occ is None:
             self.get_logger().warn("Cannot plan yet: map not available.")
+            self._publish_status("planning", "waiting_for_map")
             return
 
         pose = self.get_robot_pose_map()
         if pose is None or self.goal_world is None:
             self.get_logger().warn("Cannot plan yet: missing TF pose or goal.")
+            if self.goal_world is not None:
+                self._publish_status("planning", "waiting_for_tf")
             return
 
         sx, sy, _ = pose
@@ -491,14 +579,32 @@ class GlobalAStarPotentialFieldNode(Node):
 
         start = world_to_grid(sx, sy, self.origin, self.resolution, self.H)
         goal = world_to_grid(gx, gy, self.origin, self.resolution, self.H)
+        start = (
+            int(clamp(start[0], 0, self.H - 1)),
+            int(clamp(start[1], 0, self.W - 1)),
+        )
+        goal = (
+            int(clamp(goal[0], 0, self.H - 1)),
+            int(clamp(goal[1], 0, self.W - 1)),
+        )
+
+        if self.grid[start[0], start[1]] != 0:
+            start = self._nearest_free_cell(start)
+        if self.grid[goal[0], goal[1]] != 0:
+            goal = self._nearest_free_cell(goal)
+        if start is None or goal is None:
+            self.get_logger().error("A* failed: start or goal is trapped inside inflated obstacles.")
+            self._publish_status("failed", "no_free_start_or_goal")
+            self._clear_navigation(clear_goal=True)
+            self.publish_markers()
+            return
 
         allow_diag = self.get_parameter("allow_diagonal").value
         path = astar(self.grid, start, goal, allow_diagonal=allow_diag)
         if path is None:
             self.get_logger().error("A* failed: no path found (start/goal may be in obstacle).")
-            self.global_path_cells = []
-            self.waypoints_world = []
-            self.wp_index = 0
+            self._publish_status("failed", "no_path_found")
+            self._clear_navigation(clear_goal=True)
             self.publish_markers()
             return
 
@@ -510,8 +616,10 @@ class GlobalAStarPotentialFieldNode(Node):
 
         self.waypoints_world = [grid_to_world(r, c, self.origin, self.resolution, self.H) for (r, c) in wp_cells]
         self.wp_index = 0
+        self.pose_history.clear()
 
         self.get_logger().info(f"Global path: {len(path)} cells, waypoints: {len(self.waypoints_world)}")
+        self._publish_status("navigating", "path_ready")
         self.publish_markers()
 
     def publish_markers(self):
@@ -575,6 +683,14 @@ class GlobalAStarPotentialFieldNode(Node):
             return
 
         x, y, yaw = pose
+        if self._is_stuck(x, y):
+            self.get_logger().warn(f"Navigation failed: robot appears stuck at ({x:.2f}, {y:.2f}).")
+            self.cmd_pub.publish(Twist())
+            self._publish_status("failed", "robot_stuck")
+            self._clear_navigation(clear_goal=True)
+            self.publish_markers()
+            return
+
         # If we have already passed a waypoint (e.g., skirted around an obstacle),
         # and never got within the reached radius, skip it so we never backtrack.
         wp_reached_dist = float(self.get_parameter("wp_reached_dist_m").value)
@@ -623,7 +739,9 @@ class GlobalAStarPotentialFieldNode(Node):
                     f"Goal reached at ({gx:.2f}, {gy:.2f})."
                 )
                 self.cmd_pub.publish(Twist())
-                self.wp_index = total_wps
+                self._publish_status("succeeded", "goal_reached")
+                self._clear_navigation(clear_goal=True)
+                self.publish_markers()
                 return
 
             self.get_logger().info(
@@ -709,9 +827,15 @@ def main():
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.cmd_pub.publish(Twist())
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        try:
+            if rclpy.ok():
+                node.cmd_pub.publish(Twist())
+        except Exception:
+            pass
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
