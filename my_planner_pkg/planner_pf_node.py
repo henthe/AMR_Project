@@ -274,8 +274,8 @@ class GlobalAStarPotentialFieldNode(Node):
         self.declare_parameter("unknown_is_obstacle", True)
 
         self.declare_parameter("allow_diagonal", True)
-        self.declare_parameter("waypoint_every_n_cells", 30)
-        self.declare_parameter("waypoints_include_turns", True)
+        self.declare_parameter("waypoint_every_n_cells", 50)
+        self.declare_parameter("waypoints_include_turns", False)
 
         self.declare_parameter("k_att", 1.0)
         self.declare_parameter("k_rep", 0.8)
@@ -283,8 +283,8 @@ class GlobalAStarPotentialFieldNode(Node):
         self.declare_parameter("stop_range_m", 0.20)
 
         self.declare_parameter("k_heading", 1.8)
-        self.declare_parameter("max_lin", 1.0)
-        self.declare_parameter("max_ang", 1.5)
+        self.declare_parameter("max_lin", 0.8)
+        self.declare_parameter("max_ang", 0.5)
         self.declare_parameter("wp_reached_dist_m", 0.20)
         self.declare_parameter("lin_scale_on_heading", 1.0)
         self.declare_parameter("stuck_window_s", 8.0)
